@@ -63,6 +63,7 @@ use soroban_sdk as _;
 // crate `pub` does not widen the wasm export surface — only `#[contractimpl]`
 // entry points are callable on-chain.
 pub mod admin;
+pub mod contract;
 pub mod storage_types;
 
 #[cfg(test)]

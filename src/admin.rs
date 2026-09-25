@@ -50,6 +50,31 @@ pub struct AdminTransferred {
     pub new_admin: Address,
 }
 
+/// Emitted when the contract is initialized with a hard supply cap.
+///
+/// There is deliberately no counterpart event: the cap can never be raised
+/// afterwards.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxSupplyInitialized {
+    /// The address that was made admin.
+    #[topic]
+    pub admin: Address,
+    /// The cap fixed for the lifetime of the contract.
+    pub max_supply: i128,
+}
+
+/// Emitted when the clawback co-signer is set or replaced.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClawbackCosignerSet {
+    /// The admin that set the co-signer.
+    #[topic]
+    pub admin: Address,
+    /// The co-signer that must now authorise every clawback.
+    pub cosigner: Address,
+}
+
 /// Whether the contract has been initialized, i.e. whether an admin is set.
 ///
 /// Reads instance storage without bumping: this is a cheap existence check
@@ -84,6 +109,18 @@ fn load_admin(e: &Env) -> Address {
         Some(admin) => admin,
         None => panic!("contract not initialized"),
     }
+}
+
+/// The current admin.
+///
+/// # Panics
+///
+/// With `"contract not initialized"` if no admin is set. This is deliberately
+/// not an `Option`: a caller that has to handle "no admin" on the read path is
+/// a caller that is about to do something wrong.
+pub fn current_admin(e: &Env) -> Address {
+    require_initialized(e);
+    load_admin(e)
 }
 
 /// Authorize `caller` as the admin, or panic.
@@ -203,4 +240,122 @@ pub fn accept_admin(e: &Env, new_admin: Address) {
         new_admin,
     }
     .publish(e);
+}
+
+/// Set the initial admin and a hard supply cap in one call.
+///
+/// Equivalent to [`initialize`] plus a cap that can never be changed, for
+/// deployments that want a fixed ceiling from the first ledger. There is
+/// deliberately no `set_max_supply` anywhere in this contract: a cap that can
+/// be raised later is not a cap, and the guard that would stop a future
+/// contributor from adding one is the absence of the function.
+///
+/// [`initialize`] remains available for deployments that want no cap at all.
+///
+/// # Panics
+///
+/// With `"max supply must be positive"` if `max_supply` is not strictly
+/// positive, or `"contract already initialized"` if an admin is already set.
+pub fn initialize_with_max_supply(e: Env, admin: Address, max_supply: i128) {
+    // Validate the cap before touching state, so a rejected call leaves nothing
+    // behind even in a host that does not roll back on panic.
+    if max_supply <= 0 {
+        panic!("max supply must be positive");
+    }
+    bump_instance(&e);
+    // Delegates the "exactly one admin" rule to the single initialization path
+    // rather than reimplementing it, so the two cannot drift apart.
+    initialize(e.clone(), admin.clone());
+    e.storage().instance().set(&DataKey::MaxSupply, &max_supply);
+    MaxSupplyInitialized { admin, max_supply }.publish(&e);
+}
+
+/// The nominated next admin, if a transfer is in flight.
+///
+/// `None` means no transfer is outstanding — either none was ever proposed, or
+/// the last one completed and was cleared.
+///
+/// Reads state without authorizing: an operator watching for an in-flight
+/// rotation has no admin key and still needs to see it.
+pub fn pending_admin(e: &Env) -> Option<Address> {
+    e.storage().instance().get(&DataKey::PendingAdmin)
+}
+
+/// The ledger from which the most recent accepted admin is authoritative.
+///
+/// `0` means no admin has taken over yet. Recorded on both propose and accept
+/// so an operator can tell a stale proposal from a fresh one.
+pub fn admin_active_after_ledger(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&DataKey::AdminActiveAfterLedger)
+        .unwrap_or(0)
+}
+
+/// The hard supply cap fixed at initialization, if this deployment has one.
+///
+/// `None` for a contract initialized with plain [`initialize`].
+pub fn max_supply(e: &Env) -> Option<i128> {
+    e.storage().instance().get(&DataKey::MaxSupply)
+}
+
+/// Set or replace the address that must co-sign every clawback.
+///
+/// Clawback is the most dangerous power an admin holds, and a single
+/// compromised key should not be enough to exercise it. Naming a co-signer
+/// raises that bar from one key to two, which limits the blast radius of that
+/// compromise to *disabling* clawback rather than *using* it.
+///
+/// Passing the current co-signer again is how it is replaced. There is
+/// deliberately no `clear_clawback_cosigner`: silently dropping back to a single
+/// key would reintroduce exactly the risk this guards against, so removing a
+/// co-signer means rotating the admin to a contract that never had one.
+///
+/// # Panics
+///
+/// With `"contract not initialized"` or `"caller is not the admin"` if `admin`
+/// is not authorized, or `"co-signer must differ from the admin"` if the
+/// co-signer is the admin itself. A co-signer equal to the admin would satisfy
+/// the dual-authorization requirement with one signature.
+pub fn set_clawback_cosigner(e: &Env, admin: &Address, cosigner: &Address) {
+    bump_instance(e);
+    check_admin(e, admin);
+
+    if admin == cosigner {
+        panic!("co-signer must differ from the admin");
+    }
+
+    e.storage()
+        .instance()
+        .set(&DataKey::ClawbackCosigner, cosigner);
+    ClawbackCosignerSet {
+        admin: admin.clone(),
+        cosigner: cosigner.clone(),
+    }
+    .publish(e);
+}
+
+/// The configured clawback co-signer, if any.
+pub fn read_clawback_cosigner(e: &Env) -> Option<Address> {
+    e.storage().instance().get(&DataKey::ClawbackCosigner)
+}
+
+/// Authorize a clawback: the admin always, plus the co-signer when one is set.
+///
+/// Clawback entry points call this rather than `check_admin` directly, so that
+/// adding a co-signer later cannot leave some existing clawback path
+/// single-signed. Falls back to admin-only authorization when no co-signer is
+/// configured, which is what makes the feature opt-in.
+///
+/// # Panics
+///
+/// With `"contract not initialized"` or `"caller is not the admin"` if `admin`
+/// is not authorized. When a co-signer is configured, a missing co-signer
+/// signature surfaces as an authorization failure from `require_auth` rather
+/// than a panic message of our own.
+pub fn require_clawback_auth(e: &Env, admin: &Address) {
+    check_admin(e, admin);
+    if let Some(cosigner) = read_clawback_cosigner(e) {
+        cosigner.require_auth();
+    }
 }
