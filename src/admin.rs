@@ -138,6 +138,45 @@ pub fn check_admin(e: &Env, caller: &Address) {
     let admin = load_admin(e);
     if admin != *caller {
         panic!("caller is not the admin");
+use crate::storage_types::DataKey;
+use soroban_sdk::{Address, Env};
+
+/// True once `initialize` has stored an admin address.
+pub fn is_initialized(e: &Env) -> bool {
+    e.storage().persistent().has(&DataKey::Admin)
+}
+
+/// Panics while the contract is still uninitialized.
+pub fn require_initialized(e: &Env) {
+    if !is_initialized(e) {
+        panic!("NotInitialized: call initialize before using the contract");
+    }
+}
+
+/// The address that currently holds admin authority.
+pub fn admin(e: &Env) -> Address {
+    e.storage()
+        .persistent()
+        .get(&DataKey::Admin)
+        .expect("NotInitialized: admin not set")
+}
+
+/// True when `caller` is the stored admin.
+pub fn is_admin(e: &Env, caller: &Address) -> bool {
+    e.storage()
+        .persistent()
+        .get::<_, Address>(&DataKey::Admin)
+        == Some(*caller)
+}
+
+/// Requires that `caller` is the stored admin and authorized this invocation.
+///
+/// Admin-gated entry points call this first so an unauthorized address can never
+/// reach the state transition behind it.
+pub fn check_admin(e: &Env, caller: &Address) {
+    require_initialized(e);
+    if !is_admin(e, caller) {
+        panic!("Unauthorized: caller is not the contract admin");
     }
     caller.require_auth();
 }
@@ -358,4 +397,34 @@ pub fn require_clawback_auth(e: &Env, admin: &Address) {
     if let Some(cosigner) = read_clawback_cosigner(e) {
         cosigner.require_auth();
     }
+/// The second address required to approve a clawback, when one is configured.
+pub fn co_signer(e: &Env) -> Option<Address> {
+    e.storage().persistent().get(&DataKey::CoSigner)
+}
+
+/// Records the optional clawback co-signer during initialization.
+pub fn store_co_signer(e: &Env, co_signer: &Option<Address>) {
+    if let Some(signer) = co_signer {
+        e.storage().persistent().set(&DataKey::CoSigner, signer);
+    }
+}
+
+/// Requires the co-signer's authorization when one is configured.
+///
+/// A deployment without a co-signer must not be blocked, so an absent co-signer
+/// is a no-op rather than a failure: single-admin deployments claw back exactly
+/// as they would without this check.
+pub fn require_co_signer(e: &Env) {
+    if let Some(signer) = co_signer(e) {
+        signer.require_auth();
+    }
+}
+
+/// Ledger the contract was initialized on, or 0 when it never was.
+pub fn initialized_at_ledger(e: &Env) -> u32 {
+    e.storage()
+        .persistent()
+        .get(&DataKey::InitializedAtLedger)
+        .unwrap_or(0)
+}
 }

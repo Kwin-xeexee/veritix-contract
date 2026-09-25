@@ -28,3 +28,14 @@ rustflags = [
     "-Clink-arg=-s",
     "-Clink-arg=--gc-sections",
 ]
+[build]
+rustflags = ["-D", "warnings"]
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
