@@ -62,4 +62,8 @@ use soroban_sdk as _;
 // report them as unused the moment they are added. On a `cdylib` contract
 // crate `pub` does not widen the wasm export surface — only `#[contractimpl]`
 // entry points are callable on-chain.
+pub mod admin;
 pub mod storage_types;
+
+#[cfg(test)]
+mod admin_test;
