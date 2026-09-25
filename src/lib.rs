@@ -56,3 +56,4 @@ use soroban_sdk as _;
 // Module declarations are added here as each module lands in the backlog, so
 // that every link in the stack compiles on its own. Test modules stay behind
 // `#[cfg(test)]` and are never compiled into the wasm artifact.
+mod storage_types;
