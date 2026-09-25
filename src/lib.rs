@@ -36,23 +36,22 @@
 #[cfg(test)]
 extern crate std;
 
-// A Soroban contract is a `no_std` wasm module with no unwinding runtime, so it
-// must supply its own panic handler. Hitting it executes `unreachable`, which
-// traps the contract and reverts the whole transaction — the intended outcome
-// for a failed call, and the reason a partial state change can never persist.
-//
-// Only the wasm target gets a handler, and that is deliberate. Defining one
-// forces `panic = "abort"` semantics, which cannot be reconciled with the
-// unwinding dev profile, and a host-side handler would collide with the one
-// `std` provides under `cfg(test)`. The consequence for tooling is that the
-// host library target is never built directly: lint the contract with
-// `cargo clippy --lib --target wasm32v1-none` and lint the tests with
-// `cargo clippy --tests`. See .github/workflows/ci.yml.
-#[cfg(target_family = "wasm")]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
+// `soroban-sdk` supplies the wasm `#[panic_handler]`, so this crate must not
+// declare a second one — two handlers in one link are a duplicate `panic_impl`
+// lang item. But a handler is mandatory for a `no_std` wasm module, and the
+// SDK's is only linked once something in the crate actually references it. The
+// crate root is empty until the first module lands, so reference the SDK here
+// to keep its panic handler present at every point in the build. This is an
+// anonymous import: it pulls the dependency in without binding a name, and
+// introduces no unused-import warning.
+use soroban_sdk as _;
+
+// The SDK's handler is gated on `target_family = "wasm"`, so the host library
+// target still has no handler at all. A `#![no_std]` crate built for a host
+// target therefore cannot be built directly, which is why tooling lints the
+// contract with `cargo clippy --lib --target wasm32v1-none` and lints the tests
+// with `cargo clippy --tests` on the host, where `extern crate std` above
+// supplies a handler. See .github/workflows/ci.yml.
 
 // Module declarations are added here as each module lands in the backlog, so
 // that every link in the stack compiles on its own. Test modules stay behind
