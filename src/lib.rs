@@ -56,4 +56,10 @@ use soroban_sdk as _;
 // Module declarations are added here as each module lands in the backlog, so
 // that every link in the stack compiles on its own. Test modules stay behind
 // `#[cfg(test)]` and are never compiled into the wasm artifact.
-mod storage_types;
+//
+// `pub mod`, per CONTRIBUTING.md. It also keeps `dead_code` honest: helpers
+// land here before the modules that call them, and a private module would
+// report them as unused the moment they are added. On a `cdylib` contract
+// crate `pub` does not widen the wasm export surface — only `#[contractimpl]`
+// entry points are callable on-chain.
+pub mod storage_types;
