@@ -1,0 +1,101 @@
+name: CI
+
+# Runs on every pull request, not only those targeting `main`. The rebuild
+# backlog is delivered as a stack of dependent branches, so the intermediate
+# PRs need the same gate as the final one.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The wasm artifact must stay under the Soroban limit enforced below.
+  WASM_SIZE_LIMIT: 65536
+  # soroban-sdk >= 28 refuses to build unless it is told the build system
+  # supports spec shaking v2. `stellar contract build` (stellar-cli 25.2.0+)
+  # sets this for you; this workflow calls cargo directly, so it sets it here.
+  SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2: "1"
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustup show
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustup show
+      - name: Add wasm target
+        run: rustup target add wasm32v1-none
+      # This crate is `#![no_std]` and defines a `#[panic_handler]` for the wasm
+      # target only. That means the host library target has no panic handler to
+      # link against, so `cargo clippy --all-targets` cannot run on the host.
+      # Lint is therefore split in two: the contract itself is linted for the
+      # target it actually ships as, and the tests are linted on the host where
+      # `extern crate std` is in effect.
+      - name: Lint the contract for the wasm target
+        run: cargo clippy --lib --target wasm32v1-none -- -D warnings
+      - name: Lint the test targets
+        run: cargo clippy --tests --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustup show
+      - name: cargo test
+        run: cargo test --all-features
+
+  wasm:
+    name: Build wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustup show
+      - name: Add wasm target
+        run: rustup target add wasm32v1-none
+      - name: Build release wasm
+        run: cargo build --release --target wasm32v1-none
+      - name: Check artifact size against the Soroban limit
+        run: |
+          set -euo pipefail
+          artifact="$(find target/wasm32v1-none/release -maxdepth 1 \
+            -name '*.wasm' -not -name '*.custom_wasm*' | head -n 1)"
+          if [ -z "$artifact" ]; then
+            echo "::error::no .wasm artifact was produced"
+            exit 1
+          fi
+          size=$(stat -c%s "$artifact")
+          echo "artifact: $artifact"
+          echo "size: $size bytes (limit: $WASM_SIZE_LIMIT bytes)"
+          if [ "$size" -gt "$WASM_SIZE_LIMIT" ]; then
+            echo "::error::wasm artifact is $size bytes, over the $WASM_SIZE_LIMIT byte limit"
+            exit 1
+          fi
+      - name: Upload wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: veritix-pay-wasm
+          path: target/wasm32v1-none/release/*.wasm
+          if-no-files-found: error

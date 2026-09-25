@@ -1,0 +1,30 @@
+# Build flags for the on-chain wasm artifact.
+#
+# Target: `wasm32v1-none`, not `wasm32-unknown-unknown`.
+#
+# soroban-sdk 28's build script rejects `wasm32-unknown-unknown` on any Rust
+# 1.82 or newer, because that target enables `reference-types` and
+# `multi-value`, which the Soroban environment does not support. Building for
+# the older target requires pinning Rust to 1.81 or earlier, which forfeits
+# current toolchain fixes. `wasm32v1-none` is the target the Soroban
+# environment is built for, and is what `stellar contract build` uses.
+#
+# The wasm target is intentionally NOT set as the default `[build] target`.
+# The unit tests in this crate use the `testutils` feature of soroban-sdk and
+# must run on the host, so a global default of wasm would break `cargo test`
+# and the `test` CI job. `make wasm` passes `--target wasm32v1-none`
+# explicitly instead.
+
+[target.wasm32v1-none]
+# `-Clink-arg=-s` strips the symbol table from the linked artifact, and
+# `-Clink-arg=--gc-sections` drops unreferenced sections. Together with
+# `opt-level = "z"` and `lto = true` in Cargo.toml these keep the contract
+# under the Soroban 64 KiB wasm size limit.
+#
+# The flags are written without a space after `-C` deliberately: as a single
+# argv element, `-C link-arg=-s` is passed through as one token and rustc
+# rejects it as an unknown codegen option.
+rustflags = [
+    "-Clink-arg=-s",
+    "-Clink-arg=--gc-sections",
+]
