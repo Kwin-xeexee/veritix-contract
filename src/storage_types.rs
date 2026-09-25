@@ -9,6 +9,8 @@ use soroban_sdk::{contracttype, Address};
 pub enum DataKey {
     /// Address holding admin authority.
     Admin,
+    /// Optional second address that must co-sign every clawback.
+    CoSigner,
     /// Ledger on which `initialize` ran.
     InitializedAtLedger,
     /// Token name reported by `name()`.
@@ -23,4 +25,10 @@ pub enum DataKey {
     MaxSupply,
     /// Balance held by a single account.
     BalanceOf(Address),
+    /// Whether an account is frozen and cannot move tokens.
+    Frozen(Address),
+    /// Whether the whole contract is paused.
+    Paused,
+    /// Total tokens held in active escrows for an account.
+    EscrowLocked(Address),
 }

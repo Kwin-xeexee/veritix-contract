@@ -11,6 +11,7 @@ extern crate std;
 mod admin;
 mod balance;
 mod contract;
+mod control;
 mod events;
 mod metadata;
 mod storage_types;

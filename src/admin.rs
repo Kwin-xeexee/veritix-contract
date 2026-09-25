@@ -41,10 +41,34 @@ pub fn check_admin(e: &Env, caller: &Address) {
     caller.require_auth();
 }
 
+/// The second address required to approve a clawback, when one is configured.
+pub fn co_signer(e: &Env) -> Option<Address> {
+    e.storage().persistent().get(&DataKey::CoSigner)
+}
+
+/// Records the optional clawback co-signer during initialization.
+pub fn store_co_signer(e: &Env, co_signer: &Option<Address>) {
+    if let Some(signer) = co_signer {
+        e.storage().persistent().set(&DataKey::CoSigner, signer);
+    }
+}
+
+/// Requires the co-signer's authorization when one is configured.
+///
+/// A deployment without a co-signer must not be blocked, so an absent co-signer
+/// is a no-op rather than a failure: single-admin deployments claw back exactly
+/// as they would without this check.
+pub fn require_co_signer(e: &Env) {
+    if let Some(signer) = co_signer(e) {
+        signer.require_auth();
+    }
+}
+
 /// Ledger the contract was initialized on, or 0 when it never was.
 pub fn initialized_at_ledger(e: &Env) -> u32 {
     e.storage()
         .persistent()
         .get(&DataKey::InitializedAtLedger)
         .unwrap_or(0)
+}
 }
