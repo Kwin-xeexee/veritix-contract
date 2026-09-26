@@ -1,0 +1,1 @@
+# Contributing\n\nIssue-claiming and PR rules.\n

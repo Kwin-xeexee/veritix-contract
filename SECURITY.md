@@ -1,0 +1,1 @@
+# Security Policy\n\nReporting vulnerabilities.\n
