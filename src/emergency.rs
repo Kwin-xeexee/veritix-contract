@@ -1,0 +1,1 @@
+pub fn emergency_withdraw() {\n    // withdraw stranded tokens\n}\n
