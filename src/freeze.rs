@@ -1,0 +1,1 @@
+pub fn freeze_until() {\n    // timed freeze\n}\n
