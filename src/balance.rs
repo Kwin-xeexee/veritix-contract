@@ -1,14 +1,8 @@
-use crate::authorization;
-use crate::events::{Burn, Mint, Transfer, TransferWithMemo};
+use crate::control;
+use crate::events::{Burn, Clawback, Mint, Transfer, TransferWithMemo};
 use crate::storage_types::DataKey;
 use crate::validation::{require_memo_within_limit, require_positive_amount};
 use soroban_sdk::{Address, Bytes, Env, Vec};
-use crate::control;
-use crate::events::{Burn, Clawback, Mint, Transfer};
-use crate::events::Mint;
-use crate::storage_types::DataKey;
-use crate::validation::require_positive_amount;
-use soroban_sdk::{Address, Env};
 
 /// Tokens in circulation. An absent key means the contract has minted nothing.
 pub fn total_supply(e: &Env) -> i128 {
@@ -20,10 +14,9 @@ pub fn total_supply(e: &Env) -> i128 {
 
 /// The configured hard cap on total supply, or 0 when supply is unlimited.
 ///
-/// The `0` sentinel means "no cap configured" rather than "no tokens may ever
-/// exist": the cap is only written by the initializer, and an unset cap must
-/// not block minting. A deployment that never configures one is uncapped.
-/// The configured hard cap, or 0 when supply is uncapped.
+/// The `0` sentinel means "no cap has been configured" rather than "no tokens may
+/// ever exist": the cap is only written by the initializer, and an unset cap
+/// must not read as a cap of zero.
 pub fn max_supply(e: &Env) -> i128 {
     e.storage().persistent().get(&DataKey::MaxSupply).unwrap_or(0)
 }
@@ -37,11 +30,6 @@ pub fn balance_of(e: &Env, account: &Address) -> i128 {
 }
 
 /// Every account that currently holds a positive balance, in credit order.
-///
-/// Airdrops and dividend sweeps enumerate this instead of scanning balances, so
-/// a stale entry is not a cosmetic problem — it pays a holder who has already
-/// emptied their balance. Insert and removal are therefore handled in
-/// [`credit`] and [`debit`] rather than left to callers.
 pub fn holders(e: &Env) -> Vec<Address> {
     e.storage()
         .persistent()
@@ -49,15 +37,39 @@ pub fn holders(e: &Env) -> Vec<Address> {
         .unwrap_or_else(|| Vec::new(e))
 }
 
-/// Number of accounts in [`holders`].
-///
-/// Cached alongside the set so the common case — "how many people do I need to
-/// pay" — does not deserialize the whole set on every query.
+/// Number of accounts in [`holders`], cached so counting stays O(1).
 pub fn holder_count(e: &Env) -> u32 {
     e.storage()
         .persistent()
         .get(&DataKey::HolderCount)
         .unwrap_or(0)
+}
+
+/// Tokens of `account` held in active escrows and therefore not transferable.
+pub fn escrow_locked(e: &Env, account: &Address) -> i128 {
+    e.storage()
+        .persistent()
+        .get(&DataKey::EscrowLocked(account.clone()))
+        .unwrap_or(0)
+}
+
+/// Tokens `account` may actually move right now.
+///
+/// A raw balance overstates what is available whenever part of it is escrowed or
+/// the account is frozen, and a caller that trusts the balance instead of this
+/// figure is the bug this view exists to prevent. Frozen accounts report `0`
+/// because nothing at all is transferable, and the subtraction is floored at
+/// zero so a stale lock record can never make this view wrap negative.
+pub fn spendable_balance(e: &Env, account: &Address) -> i128 {
+    if control::is_frozen(e, account) {
+        return 0;
+    }
+    let available = balance_of(e, account) - escrow_locked(e, account);
+    if available > 0 {
+        available
+    } else {
+        0
+    }
 }
 
 /// Adds `account` to the holder set if it is not already a member.
@@ -82,39 +94,12 @@ fn remove_holder(e: &Env, account: &Address) {
     e.storage()
         .persistent()
         .set(&DataKey::HolderCount, &set.len());
-/// Tokens of `account` that are held in active escrows and cannot be spent.
-pub fn escrow_locked(e: &Env, account: &Address) -> i128 {
-    e.storage()
-        .persistent()
-        .get(&DataKey::EscrowLocked(account.clone()))
-        .unwrap_or(0)
-}
-
-/// Tokens `account` may actually move right now.
-///
-/// A raw balance overstates what is available whenever part of it is escrowed
-/// or the account is frozen, and a caller that trusts the balance instead of
-/// this figure is the bug this view exists to prevent. Frozen accounts report
-/// `0` because nothing at all is transferable. The subtraction is floored at
-/// zero so stale lock records can never make this view wrap negative.
-pub fn spendable_balance(e: &Env, account: &Address) -> i128 {
-    if control::is_frozen(e, account) {
-        return 0;
-    }
-    let available = balance_of(e, account) - escrow_locked(e, account);
-    if available > 0 {
-        available
-    } else {
-        0
-    }
 }
 
 /// Credits `amount` to `account` without touching total supply.
 ///
-/// Callers that bring new tokens into circulation must also call
-/// [`increase_supply`] so the two ledgers cannot drift apart. A transition from
-/// zero to a positive balance is what puts an account on the holder set.
-/// [`increase_supply`] so the two ledgers cannot drift apart.
+/// A transition from zero to a positive balance is what puts an account on the
+/// holder set, so the two can never disagree.
 pub fn credit(e: &Env, account: &Address, amount: i128) {
     let new_balance = balance_of(e, account)
         .checked_add(amount)
@@ -127,8 +112,9 @@ pub fn credit(e: &Env, account: &Address, amount: i128) {
 
 /// Debits `amount` from `account`.
 ///
-/// Reaching zero removes the account from the holder set in the same step that
-/// deletes its balance key, so the set cannot outlive the balances it mirrors.
+/// Reaching zero deletes the balance key and drops the account from the holder
+/// set in the same step, so an enumerating sweep can never pay a holder who
+/// has already emptied their balance.
 ///
 /// # Panics
 ///
@@ -152,14 +138,6 @@ pub fn debit(e: &Env, account: &Address, amount: i128) {
 }
 
 /// Adds `amount` to total supply, enforcing the configured cap.
-///
-/// A cap of 0 is the "no cap" sentinel: `max_supply` is unset until the
-/// initializer opts into a limit, and an absent cap must not block minting.
-///
-/// # Panics
-///
-/// Panics with `SupplyCapExceeded` when the cap is set and the new total would
-/// exceed it, and with `SupplyOverflow` on an `i128` overflow.
 pub fn increase_supply(e: &Env, amount: i128) {
     let new_supply = total_supply(e)
         .checked_add(amount)
@@ -185,14 +163,6 @@ pub fn decrease_supply(e: &Env, amount: i128) {
 }
 
 /// Brings `amount` of new tokens into circulation for `to`.
-///
-/// This is the only place that credits balances and grows supply together, so
-/// the two ledgers cannot be updated independently and drift apart.
-///
-/// # Panics
-///
-/// Panics through [`require_positive_amount`] on a non-positive `amount` and
-/// through [`increase_supply`] when the cap would be exceeded.
 pub fn mint(e: &Env, to: &Address, amount: i128) {
     require_positive_amount(amount);
     increase_supply(e, amount);
@@ -204,11 +174,7 @@ pub fn mint(e: &Env, to: &Address, amount: i128) {
     .publish(e);
 }
 
-/// Destroys `amount` of `from`'s tokens, reducing both the balance and supply.
-///
-/// # Panics
-///
-/// Panics on a non-positive `amount` and when the balance is too small.
+/// Destroys `amount` of `from`'s own tokens, reducing balance and supply.
 pub fn burn(e: &Env, from: &Address, amount: i128) {
     require_positive_amount(amount);
     debit(e, from, amount);
@@ -220,36 +186,27 @@ pub fn burn(e: &Env, from: &Address, amount: i128) {
     .publish(e);
 }
 
-/// Moves `amount` of tokens from `from` to `to`, leaving total supply untouched.
+/// Destroys `amount` of `from`'s tokens on `spender`'s authority, reducing
+/// balance and supply.
 ///
-/// The authorization check lives here rather than in the contract entry point
-/// so that every way of moving tokens — plain, memo-carrying, or added later —
-/// consults the same flag. The debit runs before the credit so an insufficient
-/// balance aborts before the recipient is paid.
-///
-/// # Panics
-///
-/// Panics on a non-positive `amount`, when `from` is not authorized, or when
-/// `from` holds less than `amount`.
-pub fn transfer(e: &Env, from: &Address, to: &Address, amount: i128) {
+/// Mirrors [`burn`] but consumes an allowance instead of requiring the holder to
+/// sign, and emits the same `["burn", from]` event: the tokens left `from`'s
+/// account either way, and an indexer reconstructing balances from events should
+/// not have to care which signature was used.
+pub fn burn_from(e: &Env, spender: &Address, from: &Address, amount: i128) {
     require_positive_amount(amount);
-    authorization::require_authorized(e, from);
+    crate::allowance::consume_allowance(e, from, spender, amount);
     debit(e, from, amount);
-    credit(e, to, amount);
-    Transfer {
+    decrease_supply(e, amount);
+    Burn {
         from: from.clone(),
-        to: to.clone(),
+        amount,
+    }
+    .publish(e);
+}
+
 /// Removes `amount` from `from` for an admin clawback, without the holder
 /// authorizing the spend.
-///
-/// This is deliberately separate from [`burn`]: the two differ in who allowed
-/// the tokens to leave and in which event they emit, so an auditor can tell a
-/// holder's own burn apart from an admin recovery in the event log even though
-/// both reduce supply.
-///
-/// # Panics
-///
-/// Panics on a non-positive `amount` and when the balance is too small.
 pub fn clawback(e: &Env, admin: &Address, from: &Address, amount: i128) {
     require_positive_amount(amount);
     debit(e, from, amount);
@@ -262,44 +219,12 @@ pub fn clawback(e: &Env, admin: &Address, from: &Address, amount: i128) {
     .publish(e);
 }
 
-/// Moves `amount` from `from` to `to` and tags the movement with an opaque
-/// `memo`.
+/// Moves `amount` of tokens from `from` to `to`, leaving total supply untouched.
 ///
-/// Same state transition as [`transfer`], and the same authorization check, with
-/// the memo carried only in the event. Nothing about the memo is interpreted or
-/// stored, which is what lets a ticketing platform attach an order reference
-/// without a second write to the contract's storage.
-///
-/// # Panics
-///
-/// Panics through [`require_memo_within_limit`] when the memo exceeds
-/// [`crate::validation::MAX_MEMO_BYTES`], and with everything [`transfer`]
-/// panics on.
-pub fn transfer_with_memo(e: &Env, from: &Address, to: &Address, amount: i128, memo: Bytes) {
-    require_memo_within_limit(memo.len());
-    require_positive_amount(amount);
-    authorization::require_authorized(e, from);
-    debit(e, from, amount);
-    credit(e, to, amount);
-    TransferWithMemo {
-        from: from.clone(),
-        to: to.clone(),
-        amount,
-        memo,
-    }
-    .publish(e);
-}
-/// Moves `amount` from `from` to `to`, leaving total supply untouched.
-///
-/// Every compliance control lands here. Pausing and the frozen flags are
-/// checked before any balance is read, so a blocked transfer cannot leave a
-/// half-applied state behind, and the debit runs before the credit so an
-/// insufficient balance aborts before the recipient is paid.
-///
-/// # Panics
-///
-/// Panics on a non-positive `amount`, when either party is frozen, while the
-/// contract is paused, or when `from` holds less than `amount`.
+/// The compliance checks live here rather than in the contract entry point so
+/// every way of moving tokens consults the same ones. They run before any
+/// balance is read, and the debit runs before the credit, so a rejected transfer
+/// cannot leave a half-applied state behind.
 pub fn transfer(e: &Env, from: &Address, to: &Address, amount: i128) {
     require_positive_amount(amount);
     control::require_not_paused(e);
@@ -315,48 +240,44 @@ pub fn transfer(e: &Env, from: &Address, to: &Address, amount: i128) {
     .publish(e);
 }
 
-/// Records `amount` of `account`'s tokens as held by an active escrow.
+/// Moves `amount` from `from` to `to` on `spender`'s authority, consuming the
+/// spender's allowance.
 ///
-/// # Panics
-///
-/// Panics when the account's balance cannot cover the lock.
-pub fn lock_in_escrow(e: &Env, account: &Address, amount: i128) {
+/// Identical to [`transfer`] apart from who authorized it, and it emits the same
+/// `["transfer", from, to]` event for the same indexing reason as [`burn_from`].
+pub fn transfer_from(e: &Env, spender: &Address, from: &Address, to: &Address, amount: i128) {
     require_positive_amount(amount);
-    let locked = escrow_locked(e, account);
-    let new_locked = locked
-        .checked_add(amount)
-        .unwrap_or_else(|| panic!("BalanceOverflow: escrow lock would overflow i128"));
-    if new_locked > balance_of(e, account) {
-        panic!(
-            "InsufficientBalance: {} held, cannot lock {}",
-            balance_of(e, account),
-            new_locked
-        );
+    control::require_not_paused(e);
+    control::require_not_frozen(e, from);
+    control::require_not_frozen(e, to);
+    crate::allowance::consume_allowance(e, from, spender, amount);
+    debit(e, from, amount);
+    credit(e, to, amount);
+    Transfer {
+        from: from.clone(),
+        to: to.clone(),
+        amount,
     }
-    e.storage()
-        .persistent()
-        .set(&DataKey::EscrowLocked(account.clone()), &new_locked);
+    .publish(e);
 }
 
-/// Releases `amount` of `account`'s escrow lock.
+/// Moves `amount` from `from` to `to` and tags the movement with an opaque memo.
 ///
-/// # Panics
-///
-/// Panics when the lock does not cover `amount`.
-pub fn unlock_from_escrow(e: &Env, account: &Address, amount: i128) {
+/// Same state transition as [`transfer`], with the memo carried only in the
+/// event and never written to storage.
+pub fn transfer_with_memo(e: &Env, from: &Address, to: &Address, amount: i128, memo: Bytes) {
+    require_memo_within_limit(memo.len());
     require_positive_amount(amount);
-    let locked = escrow_locked(e, account);
-    if locked < amount {
-        panic!("EscrowLockUnderflow: {} locked, {} requested", locked, amount);
+    control::require_not_paused(e);
+    control::require_not_frozen(e, from);
+    control::require_not_frozen(e, to);
+    debit(e, from, amount);
+    credit(e, to, amount);
+    TransferWithMemo {
+        from: from.clone(),
+        to: to.clone(),
+        amount,
+        memo,
     }
-    let new_locked = locked - amount;
-    if new_locked == 0 {
-        e.storage()
-            .persistent()
-            .remove(&DataKey::EscrowLocked(account.clone()));
-    } else {
-        e.storage()
-            .persistent()
-            .set(&DataKey::EscrowLocked(account.clone()), &new_locked);
-    }
+    .publish(e);
 }

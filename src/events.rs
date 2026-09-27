@@ -2,8 +2,7 @@ use soroban_sdk::{contractevent, Address, Bytes};
 
 /// New tokens were credited to `to`.
 ///
-/// Topics are `["mint", to: Address]` and the data is `[amount: i128]`, the
-/// shape indexers subscribe to for a supply increase.
+/// Topics `["mint", to: Address]`, data `[amount: i128]`.
 #[contractevent(data_format = "vec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mint {
@@ -14,7 +13,7 @@ pub struct Mint {
 
 /// `from` destroyed `amount` of their own tokens.
 ///
-/// Topics are `["burn", from: Address]` and the data is `[amount: i128]`.
+/// Topics `["burn", from: Address]`, data `[amount: i128]`.
 #[contractevent(data_format = "vec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Burn {
@@ -25,8 +24,7 @@ pub struct Burn {
 
 /// Tokens moved from `from` to `to`.
 ///
-/// Topics are `["transfer", from: Address, to: Address]` and the data is
-/// `[amount: i128]`, the shape every SEP-41 wallet already understands.
+/// Topics `["transfer", from: Address, to: Address]`, data `[amount: i128]`.
 #[contractevent(data_format = "vec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transfer {
@@ -39,12 +37,9 @@ pub struct Transfer {
 
 /// Tokens moved from `from` to `to` carrying an opaque memo.
 ///
-/// Topics are the same `["transfer", from, to]` as [`Transfer`] so a wallet
-/// still recognizes the movement, and the data is `[amount: i128,
-/// memo: Bytes]`. Reusing the `transfer` topic rather than inventing a new one
-/// is deliberate: a memo is extra information about a transfer, not a
-/// different kind of transfer, and a wallet that only knows `transfer` should
-/// still show the ticket moving.
+/// Topics are the standard `["transfer", from, to]` so a wallet that only parses
+/// `transfer` still shows the movement, and the data is
+/// `[amount: i128, memo: Bytes]`.
 #[contractevent(data_format = "vec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferWithMemo {
@@ -54,4 +49,35 @@ pub struct TransferWithMemo {
     pub to: Address,
     pub amount: i128,
     pub memo: Bytes,
+}
+
+/// `from` authorized `spender` to move up to `amount` until
+/// `expiration_ledger`.
+///
+/// Topics `["approve", from: Address, spender: Address]`, data
+/// `[amount: i128, expiration_ledger: u32]`.
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Approve {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub spender: Address,
+    pub amount: i128,
+    pub expiration_ledger: u32,
+}
+
+/// An admin recovered `amount` from `from`.
+///
+/// Topics `["clawback", admin: Address, from: Address]`, data
+/// `[amount: i128]`. The admin is a topic so an auditor can filter clawbacks by
+/// the account that performed them.
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Clawback {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub from: Address,
+    pub amount: i128,
 }
