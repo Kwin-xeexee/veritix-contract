@@ -428,3 +428,4 @@ pub fn initialized_at_ledger(e: &Env) -> u32 {
         .unwrap_or(0)
 }
 }
+}

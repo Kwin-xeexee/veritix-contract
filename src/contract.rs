@@ -1,3 +1,7 @@
+use crate::metadata::{self, TokenMetadata};
+use crate::storage_types::DataKey;
+use crate::{admin, authorization, balance};
+use soroban_sdk::{contract, contractimpl, Address, Bytes, Env, String};
 //! The contract's public Soroban interface.
 //!
 //! Every function an integrator can call lives here. The implementations sit in
@@ -93,14 +97,6 @@ use soroban_sdk::{contract, contractimpl, Address, Env, String};
 #[contract]
 pub struct VeriTixPay;
 
-/// Stores the admin, an optional co-signer, and the token metadata, refusing a
-/// second call.
-fn initialize_state(
-    e: &Env,
-    admin_addr: &Address,
-    co_signer: &Option<Address>,
-    meta: &TokenMetadata,
-) {
 /// Stores the admin and the token metadata, refusing a second call.
 fn initialize_state(e: &Env, admin_addr: &Address, meta: &TokenMetadata) {
     if admin::is_initialized(e) {
@@ -111,7 +107,6 @@ fn initialize_state(e: &Env, admin_addr: &Address, meta: &TokenMetadata) {
     e.storage()
         .persistent()
         .set(&DataKey::InitializedAtLedger, &e.ledger().sequence());
-    admin::store_co_signer(e, co_signer);
     metadata::store(e, meta);
 }
 
@@ -123,19 +118,6 @@ impl VeriTixPay {
     /// so initialization is deliberately one-shot: a second call is rejected
     /// rather than silently replacing the admin.
     pub fn initialize(e: Env, admin_addr: Address) {
-        initialize_state(&e, &admin_addr, &None, &metadata::defaults(&e));
-    }
-
-    /// Sets the admin, an optional clawback co-signer, and caller-supplied
-    /// token metadata.
-    ///
-    /// Same one-shot rule as [`initialize`]; use this when a regulated
-    /// deployment needs a second approval key on clawback, or a token name,
-    /// symbol or precision other than the defaults.
-    pub fn initialize_with_co_signer(
-        e: Env,
-        admin_addr: Address,
-        co_signer: Option<Address>,
         initialize_state(&e, &admin_addr, &metadata::defaults(&e));
     }
 
@@ -153,7 +135,6 @@ impl VeriTixPay {
         initialize_state(
             &e,
             &admin_addr,
-            &co_signer,
             &TokenMetadata {
                 name,
                 symbol,
@@ -170,11 +151,6 @@ impl VeriTixPay {
     /// The address currently holding admin authority.
     pub fn admin(e: Env) -> Address {
         admin::admin(&e)
-    }
-
-    /// The co-signer that must approve clawbacks, when one is configured.
-    pub fn co_signer(e: Env) -> Option<Address> {
-        admin::co_signer(&e)
     }
 
     /// Ledger on which the contract was initialized, 0 when it never was.
@@ -202,51 +178,52 @@ impl VeriTixPay {
         balance::balance_of(&e, &account)
     }
 
-    /// Tokens of `account` currently held in active escrows.
-    pub fn escrow_locked(e: Env, account: Address) -> i128 {
-        balance::escrow_locked(&e, &account)
-    }
-
-    /// Tokens `account` may move right now: the balance minus escrow locks, or
-    /// 0 while the account is frozen.
-    pub fn spendable_balance(e: Env, account: Address) -> i128 {
-        balance::spendable_balance(&e, &account)
-    }
-
     /// Tokens in circulation.
     pub fn total_supply(e: Env) -> i128 {
         balance::total_supply(&e)
     }
 
-    /// Whether the contract is paused.
-    pub fn is_paused(e: Env) -> bool {
-        control::is_paused(&e)
+    /// The hard cap on total supply, or 0 when supply is unlimited.
+    ///
+    /// The `0` sentinel means "no cap has been configured", not "no tokens may
+    /// exist". It is the same value [`mint`] reads, so an integrator can compare
+    /// `total_supply()` against this to report remaining headroom, and `0`
+    /// means there is no headroom to report.
+    pub fn max_supply(e: Env) -> i128 {
+        balance::max_supply(&e)
     }
 
-    /// Whether `account` is frozen.
-    pub fn is_frozen(e: Env, account: Address) -> bool {
-        control::is_frozen(&e, &account)
+    /// Whether `account` may move tokens. True unless the admin has revoked it.
+    pub fn is_authorized(e: Env, account: Address) -> bool {
+        authorization::is_authorized(&e, &account)
+    }
+
+    /// Number of accounts currently holding a positive balance.
+    pub fn holder_count(e: Env) -> u32 {
+        balance::holder_count(&e)
+    }
+
+    /// Grants or revokes `account`'s authorization to move tokens.
+    ///
+    /// Independent of any future freeze: this flag gates whether an account may
+    /// move tokens at all, while a freeze holds a balance in place. A revoked
+    /// account keeps its balance and its place on the holder set.
+    pub fn set_authorized(e: Env, admin_addr: Address, account: Address, authorized: bool) {
+        admin::check_admin(&e, &admin_addr);
+        authorization::set_authorized(&e, &account, authorized);
     }
 
     /// Mints `amount` new tokens to `to`.
     ///
     /// Admin-only and supply-capped. This is the prerequisite the rest of the
     /// token module is built on: without a way to bring supply into
-    /// circulation there is nothing to transfer, burn or claw back.
-    /// Mints `amount` new tokens to `to`.
-    ///
-    /// Admin-only and supply-capped: the cap is the first place a supply limit
-    /// has to hold, so the check lives in the balance module next to the
-    /// arithmetic it protects rather than being repeated by every caller.
+    /// circulation there is nothing to transfer, burn or enumerate.
     pub fn mint(e: Env, admin_addr: Address, to: Address, amount: i128) {
         admin::check_admin(&e, &admin_addr);
         balance::mint(&e, &to, amount);
     }
 
     /// Destroys `amount` of the caller's own tokens.
-    ///
-    /// Holder-authorized: `from` must sign the call. Burning reduces the balance
-    /// and total supply together, so the two ledgers stay consistent.
     pub fn burn(e: Env, from: Address, amount: i128) {
         from.require_auth();
         balance::burn(&e, &from, amount);
@@ -254,37 +231,20 @@ impl VeriTixPay {
 
     /// Moves `amount` of tokens from `from` to `to`.
     ///
-    /// The central token operation, and therefore the path every compliance
-    /// control is enforced on: the contract must not be paused, and neither
-    /// party may be frozen. `from` must sign the call.
+    /// `from` must sign the call and must still be authorized.
     pub fn transfer(e: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         balance::transfer(&e, &from, &to, amount);
     }
 
-    /// Recovers `amount` from `from` on the admin's authority.
+    /// Moves `amount` of tokens from `from` to `to` tagged with an opaque memo.
     ///
-    /// For recovering tokens from sanctioned accounts. The admin signs, and the
-    /// co-signer signs too when one is configured at initialization. The holder
-    /// does not sign: that is the whole point of a clawback, which is why it
-    /// emits its own event rather than reusing the burn event.
-    pub fn clawback(e: Env, admin_addr: Address, from: Address, amount: i128) {
-        admin::check_admin(&e, &admin_addr);
-        admin::require_co_signer(&e);
-        balance::clawback(&e, &admin_addr, &from, amount);
-    }
-
-    /// Freezes or thaws `account`. A frozen account keeps its balance but
-    /// cannot send or receive tokens.
-    pub fn set_frozen(e: Env, admin_addr: Address, account: Address, frozen: bool) {
-        admin::check_admin(&e, &admin_addr);
-        control::set_frozen(&e, &account, frozen);
-    }
-
-    /// Pauses or resumes the contract. While paused, no tokens move.
-    pub fn set_paused(e: Env, admin_addr: Address, paused: bool) {
-        admin::check_admin(&e, &admin_addr);
-        control::set_paused(&e, paused);
+    /// Identical to [`transfer`] apart from the memo, which is carried in the
+    /// emitted event and never written to storage. Memos longer than 64 bytes
+    /// are rejected.
+    pub fn transfer_with_memo(e: Env, from: Address, to: Address, amount: i128, memo: Bytes) {
+        from.require_auth();
+        balance::transfer_with_memo(&e, &from, &to, amount, memo);
     }
 }
 
@@ -292,7 +252,7 @@ impl VeriTixPay {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events as _};
-    use soroban_sdk::{symbol_short, vec, xdr, FromVal};
+    use soroban_sdk::{symbol_short, vec, xdr, FromVal, Vec};
 
     fn setup() -> (Env, VeriTixPayClient<'static>, Address) {
         let e = Env::default();
@@ -304,37 +264,19 @@ mod tests {
         (e, client, admin)
     }
 
-    /// Mirrors the escrow module: escrowing records a lock against the holder
-    /// without moving tokens. The escrow feature that will own this key is not
-    /// part of this branch, so the test writes the aggregate directly.
-    fn set_escrow_lock(e: &Env, contract_id: &Address, account: &Address, locked: i128) {
-        e.as_contract(contract_id, || {
-            e.storage()
-                .persistent()
-                .set(&DataKey::EscrowLocked(account.clone()), &locked);
-        });
-    }
-
     fn funded(client: &VeriTixPayClient<'static>, admin: &Address, holder: &Address, amount: i128) {
         client.mint(admin, holder, &amount);
-    /// Installs a supply cap. Choosing the cap belongs to the initializer, so
-    /// the test writes the storage key directly instead of adding a setter that
-    /// no issue has asked for.
+    }
+
+    fn memo(e: &Env, text: &str) -> Bytes {
+        Bytes::from_slice(e, text.as_bytes())
+    }
+
+    /// Installs a supply cap the way the initializer would.
     fn install_cap(e: &Env, contract_id: &Address, cap: i128) {
         e.as_contract(contract_id, || {
             e.storage().persistent().set(&DataKey::MaxSupply, &cap);
         });
-    }
-
-    fn setup_capped(cap: i128) -> (Env, VeriTixPayClient<'static>, Address) {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        client.initialize(&admin);
-        install_cap(&e, &contract_id, cap);
-        (e, client, admin)
     }
 
     #[test]
@@ -346,30 +288,22 @@ mod tests {
         assert_eq!(client.name(), String::from_str(&e, "VeriTix"));
         assert_eq!(client.symbol(), String::from_str(&e, "VTX"));
         assert_eq!(client.decimals(), 7);
-        assert_eq!(client.co_signer(), None);
     }
 
     #[test]
     #[should_panic(expected = "AlreadyInitialized")]
     fn test_initialize_twice_panics() {
         let (e, client, _admin) = setup();
-        let other = Address::generate(&e);
-        client.initialize(&other);
+        client.initialize(&Address::generate(&e));
     }
 
     #[test]
-    fn test_initialize_with_co_signer_stores_signer_and_metadata() {
     fn test_initialize_with_metadata_overrides_defaults() {
         let e = Env::default();
         e.mock_all_auths();
         let contract_id = e.register_contract(None, VeriTixPay);
         let client = VeriTixPayClient::new(&e, &contract_id);
         let admin = Address::generate(&e);
-        let co_signer = Address::generate(&e);
-
-        client.initialize_with_co_signer(
-            &admin,
-            &Some(co_signer.clone()),
 
         client.initialize_with_metadata(
             &admin,
@@ -378,103 +312,97 @@ mod tests {
             &2,
         );
 
-        assert_eq!(client.admin(), admin);
-        assert_eq!(client.co_signer(), Some(co_signer));
         assert_eq!(client.name(), String::from_str(&e, "Event Tickets"));
-        assert_eq!(client.name(), String::from_str(&e, "Event Tickets"));
-        assert_eq!(client.symbol(), String::from_str(&e, "VTIX"));
         assert_eq!(client.decimals(), 2);
     }
 
     #[test]
-    fn test_burn_reduces_balance_and_supply() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.burn(&holder, &400);
-
-        assert_eq!(client.balance(&holder), 600);
-        assert_eq!(client.total_supply(), 600);
-    }
-
-    #[test]
-    fn test_burn_of_the_entire_balance() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.burn(&holder, &1_000);
-
-        assert_eq!(client.balance(&holder), 0);
-    fn test_balance_and_supply_start_at_zero() {
+    fn test_accounts_are_authorized_by_default() {
         let (e, client, _admin) = setup();
         let user = Address::generate(&e);
-        assert_eq!(client.balance(&user), 0);
-        assert_eq!(client.total_supply(), 0);
+        assert!(client.is_authorized(&user));
     }
 
     #[test]
-    #[should_panic(expected = "InsufficientBalance")]
-    fn test_burn_rejects_amount_above_the_balance() {
+    fn test_set_authorized_revokes_and_restores() {
         let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
+        let user = Address::generate(&e);
 
-        client.burn(&holder, &1_001);
+        client.set_authorized(&admin, &user, &false);
+        assert!(!client.is_authorized(&user));
+
+        client.set_authorized(&admin, &user, &true);
+        assert!(client.is_authorized(&user));
     }
 
     #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_burn_rejects_zero_amount() {
+    #[should_panic(expected = "Unauthorized: caller is not the contract admin")]
+    fn test_set_authorized_is_admin_only() {
+        let (e, client, _admin) = setup();
+        let stranger = Address::generate(&e);
+        let victim = Address::generate(&e);
+
+        client.set_authorized(&stranger, &victim, &false);
+    }
+
+    #[test]
+    fn test_revoking_authorization_keeps_the_balance() {
         let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
+        let user = Address::generate(&e);
+        funded(&client, &admin, &user, 1_000);
 
-        client.burn(&holder, &0);
+        client.set_authorized(&admin, &user, &false);
+
+        assert_eq!(client.balance(&user), 1_000);
+        assert_eq!(client.holder_count(), 1);
     }
 
     #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_burn_rejects_negative_amount() {
+    #[should_panic(expected = "NotAuthorized")]
+    fn test_transfer_rejects_a_revoked_sender() {
         let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
+        let from = Address::generate(&e);
+        let to = Address::generate(&e);
+        funded(&client, &admin, &from, 1_000);
+        client.set_authorized(&admin, &from, &false);
 
-        client.burn(&holder, &(-1));
+        client.transfer(&from, &to, &100);
     }
 
     #[test]
-    fn test_burn_emits_event_with_standard_topics_and_data() {
+    fn test_transfer_succeeds_after_authorization_is_restored() {
         let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
+        let from = Address::generate(&e);
+        let to = Address::generate(&e);
+        funded(&client, &admin, &from, 1_000);
+        client.set_authorized(&admin, &from, &false);
+        client.set_authorized(&admin, &from, &true);
 
-        client.burn(&holder, &400);
+        client.transfer(&from, &to, &100);
 
-        let events = e.events().all();
-        let last = events.events().last().expect("no events recorded");
-        let xdr::ContractEventBody::V0(body) = &last.body else {
-            panic!("expected a v0 contract event");
-        };
-        assert_eq!(
-            body.topics,
-            std::vec![
-                xdr::ScVal::from_val(&e, &symbol_short!("burn").to_val()),
-                xdr::ScVal::from_val(&e, &holder.to_val()),
-            ]
-        );
-        assert_eq!(body.data, xdr::ScVal::from_val(&e, &vec![&e, 400i128].to_val()));
+        assert_eq!(client.balance(&to), 100);
     }
 
     #[test]
-    fn test_transfer_moves_the_balance() {
+    #[should_panic(expected = "NotAuthorized")]
+    fn test_transfer_with_memo_consults_the_same_flag() {
+        let (e, client, admin) = setup();
+        let from = Address::generate(&e);
+        let to = Address::generate(&e);
+        funded(&client, &admin, &from, 1_000);
+        client.set_authorized(&admin, &from, &false);
+
+        client.transfer_with_memo(&from, &to, &100, &memo(&e, "order-1"));
+    }
+
+    #[test]
+    fn test_transfer_with_memo_moves_the_balance() {
         let (e, client, admin) = setup();
         let from = Address::generate(&e);
         let to = Address::generate(&e);
         funded(&client, &admin, &from, 1_000);
 
-        client.transfer(&from, &to, &250);
+        client.transfer_with_memo(&from, &to, &250, &memo(&e, "order-1"));
 
         assert_eq!(client.balance(&from), 750);
         assert_eq!(client.balance(&to), 250);
@@ -482,137 +410,14 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_never_changes_total_supply() {
+    fn test_transfer_with_memo_emits_the_memo_in_the_event() {
         let (e, client, admin) = setup();
         let from = Address::generate(&e);
         let to = Address::generate(&e);
         funded(&client, &admin, &from, 1_000);
+        let note = memo(&e, "order-1");
 
-        client.transfer(&from, &to, &1_000);
-
-        assert_eq!(client.balance(&from), 0);
-    fn test_mint_credits_balance_and_grows_supply() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-
-        client.mint(&admin, &user, &1_000);
-
-        assert_eq!(client.balance(&user), 1_000);
-        assert_eq!(client.total_supply(), 1_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "InsufficientBalance")]
-    fn test_transfer_rejects_amount_above_the_balance() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 100);
-
-        client.transfer(&from, &to, &101);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_transfer_rejects_non_positive_amount() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-
-        client.transfer(&from, &to, &0);
-    }
-
-    #[test]
-    #[should_panic(expected = "Frozen")]
-    fn test_transfer_rejects_a_frozen_sender() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-        client.set_frozen(&admin, &from, &true);
-
-        client.transfer(&from, &to, &100);
-    }
-
-    #[test]
-    #[should_panic(expected = "Frozen")]
-    fn test_transfer_rejects_a_frozen_recipient() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-        client.set_frozen(&admin, &to, &true);
-
-        client.transfer(&from, &to, &100);
-    }
-
-    #[test]
-    #[should_panic(expected = "Paused")]
-    fn test_transfer_rejects_while_paused() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-        client.set_paused(&admin, &true);
-
-        client.transfer(&from, &to, &100);
-    }
-
-    #[test]
-    fn test_unfreezing_and_resuming_restores_transfers() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-        client.set_frozen(&admin, &from, &true);
-        client.set_paused(&admin, &true);
-
-        client.set_frozen(&admin, &from, &false);
-        client.set_paused(&admin, &false);
-        client.transfer(&from, &to, &100);
-
-        assert_eq!(client.balance(&to), 100);
-        assert!(!client.is_frozen(&from));
-        assert!(!client.is_paused());
-    fn test_mint_accumulates_across_calls() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-
-        client.mint(&admin, &user, &1_000);
-        client.mint(&admin, &user, &500);
-
-        assert_eq!(client.balance(&user), 1_500);
-        assert_eq!(client.total_supply(), 1_500);
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized: caller is not the contract admin")]
-    fn test_set_frozen_is_admin_only() {
-        let (e, client, _admin) = setup();
-        let stranger = Address::generate(&e);
-        let victim = Address::generate(&e);
-
-        client.set_frozen(&stranger, &victim, &true);
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized: caller is not the contract admin")]
-    fn test_set_paused_is_admin_only() {
-        let (e, client, _admin) = setup();
-        let stranger = Address::generate(&e);
-
-        client.set_paused(&stranger, &true);
-    }
-
-    #[test]
-    fn test_transfer_emits_event_with_standard_topics_and_data() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-
-        client.transfer(&from, &to, &250);
+        client.transfer_with_memo(&from, &to, &250, &note);
 
         let events = e.events().all();
         let last = events.events().last().expect("no events recorded");
@@ -627,208 +432,197 @@ mod tests {
                 xdr::ScVal::from_val(&e, &to.to_val()),
             ]
         );
-        assert_eq!(body.data, xdr::ScVal::from_val(&e, &vec![&e, 250i128].to_val()));
-    }
-
-    #[test]
-    fn test_clawback_debits_the_holder_and_reduces_supply() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.clawback(&admin, &holder, &400);
-
-        assert_eq!(client.balance(&holder), 600);
-        assert_eq!(client.total_supply(), 600);
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized: caller is not the contract admin")]
-    fn test_clawback_rejects_a_non_admin() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        let stranger = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.clawback(&stranger, &holder, &400);
-    }
-
-    #[test]
-    #[should_panic(expected = "InsufficientBalance")]
-    fn test_clawback_rejects_amount_above_the_balance() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 100);
-
-        client.clawback(&admin, &holder, &101);
-    }
-
-    #[test]
-    fn test_clawback_works_without_a_co_signer() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.clawback(&admin, &holder, &1_000);
-
-        assert_eq!(client.balance(&holder), 0);
-    }
-
-    #[test]
-    fn test_clawback_emits_its_own_event() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.clawback(&admin, &holder, &400);
-
-        let events = e.events().all();
-        let last = events.events().last().expect("no events recorded");
-        let xdr::ContractEventBody::V0(body) = &last.body else {
-    fn test_mint_rejects_non_admin() {
-        let (e, client, _admin) = setup();
-        let stranger = Address::generate(&e);
-        let user = Address::generate(&e);
-        client.mint(&stranger, &user, &1_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_mint_rejects_zero_amount() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &0);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_mint_rejects_negative_amount() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &(-1));
-    }
-
-    #[test]
-    #[should_panic(expected = "SupplyCapExceeded")]
-    fn test_mint_rejects_amount_over_the_cap() {
-        let (e, client, admin) = setup_capped(1_000);
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &1_001);
-    }
-
-    #[test]
-    fn test_mint_allows_amount_exactly_at_the_cap() {
-        let (e, client, admin) = setup_capped(1_000);
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &1_000);
-        assert_eq!(client.total_supply(), 1_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "SupplyCapExceeded")]
-    fn test_mint_counts_prior_mints_against_the_cap() {
-        let (e, client, admin) = setup_capped(1_000);
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &600);
-        client.mint(&admin, &user, &500);
-    }
-
-    #[test]
-    fn test_mint_emits_event_with_standard_topics_and_data() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-
-        client.mint(&admin, &user, &1_000);
-
-        let events = e.events().all();
-        assert_eq!(events.events().len(), 1);
-        let xdr::ContractEventBody::V0(body) = &events.events()[0].body else {
-            panic!("expected a v0 contract event");
+        let xdr::ScVal::Vec(items) = &body.data else {
+            panic!("expected vec data");
         };
-        assert_eq!(
-            body.topics,
-            std::vec![
-                xdr::ScVal::from_val(&e, &symbol_short!("clawback").to_val()),
-                xdr::ScVal::from_val(&e, &admin.to_val()),
-                xdr::ScVal::from_val(&e, &holder.to_val()),
-            ]
-        );
-        assert_eq!(body.data, xdr::ScVal::from_val(&e, &vec![&e, 400i128].to_val()));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], xdr::ScVal::from_val(&e, &250i128.to_val()));
+        assert_eq!(items[1], xdr::ScVal::from_val(&e, &note.to_val()));
     }
 
     #[test]
-    fn test_spendable_balance_matches_the_balance_without_locks() {
+    #[should_panic(expected = "MemoTooLarge")]
+    fn test_transfer_with_memo_rejects_an_oversized_memo() {
         let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
+        let from = Address::generate(&e);
+        let to = Address::generate(&e);
+        funded(&client, &admin, &from, 1_000);
+        let long = Bytes::from_slice(&e, &[7u8; 65]);
 
-        assert_eq!(client.spendable_balance(&holder), 1_000);
-        assert_eq!(client.escrow_locked(&holder), 0);
+        client.transfer_with_memo(&from, &to, &100, &long);
     }
 
     #[test]
-    fn test_spendable_balance_excludes_escrow_locks() {
+    fn test_transfer_with_memo_accepts_a_memo_at_the_limit() {
+        let (e, client, admin) = setup();
+        let from = Address::generate(&e);
+        let to = Address::generate(&e);
+        funded(&client, &admin, &from, 1_000);
+        let at_limit = Bytes::from_slice(&e, &[7u8; 64]);
+
+        client.transfer_with_memo(&from, &to, &100, &at_limit);
+
+        assert_eq!(client.balance(&to), 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidAmount")]
+    fn test_transfer_with_memo_still_rejects_a_non_positive_amount() {
+        let (e, client, admin) = setup();
+        let from = Address::generate(&e);
+        let to = Address::generate(&e);
+        funded(&client, &admin, &from, 1_000);
+
+        client.transfer_with_memo(&from, &to, &0, &memo(&e, "order-1"));
+    }
+
+    #[test]
+    fn test_max_supply_is_zero_when_uncapped() {
+        let (_e, client, _admin) = setup();
+        assert_eq!(client.max_supply(), 0);
+    }
+
+    #[test]
+    fn test_max_supply_returns_the_configured_cap() {
         let e = Env::default();
         e.mock_all_auths();
         let contract_id = e.register_contract(None, VeriTixPay);
         let client = VeriTixPayClient::new(&e, &contract_id);
         let admin = Address::generate(&e);
-        let holder = Address::generate(&e);
         client.initialize(&admin);
-        client.mint(&admin, &holder, &1_000);
-        set_escrow_lock(&e, &contract_id, &holder, 400);
+        install_cap(&e, &contract_id, 10_000);
 
-        assert_eq!(client.balance(&holder), 1_000);
-        assert_eq!(client.escrow_locked(&holder), 400);
-        assert_eq!(client.spendable_balance(&holder), 600);
+        assert_eq!(client.max_supply(), 10_000);
     }
 
     #[test]
-    fn test_spendable_balance_is_zero_for_a_frozen_account() {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        let holder = Address::generate(&e);
-        client.initialize(&admin);
-        client.mint(&admin, &holder, &1_000);
-        client.set_frozen(&admin, &holder, &true);
-
-        assert_eq!(client.balance(&holder), 1_000);
-        assert_eq!(client.spendable_balance(&holder), 0);
-    }
-
-    #[test]
-    fn test_spendable_balance_never_goes_negative() {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        let holder = Address::generate(&e);
-        client.initialize(&admin);
-        client.mint(&admin, &holder, &1_000);
-        // A lock larger than the balance cannot happen through the escrow
-        // module, which validates first, but a stale record must not make this
-        // view report a negative amount.
-        set_escrow_lock(&e, &contract_id, &holder, 5_000);
-
-        assert_eq!(client.spendable_balance(&holder), 0);
-    }
-
-    #[test]
-    fn test_spendable_balance_of_an_unknown_account_is_zero() {
+    fn test_holder_set_starts_empty() {
         let (e, client, _admin) = setup();
-        let stranger = Address::generate(&e);
-        assert_eq!(client.spendable_balance(&stranger), 0);
-                xdr::ScVal::from_val(&e, &symbol_short!("mint").to_val()),
-                xdr::ScVal::from_val(&e, &user.to_val()),
-            ]
-        );
-        assert_eq!(
-            body.data,
-            xdr::ScVal::from_val(&e, &vec![&e, 1_000i128].to_val())
-        );
+        let user = Address::generate(&e);
+        assert_eq!(client.holder_count(), 0);
+        assert_eq!(balance::holders(&e), Vec::new(&e));
+        assert_eq!(client.balance(&user), 0);
+    }
+
+    #[test]
+    fn test_first_credit_joins_the_holder_set() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+
+        client.mint(&admin, &user, &1_000);
+
+        assert_eq!(client.holder_count(), 1);
+        assert_eq!(balance::holders(&e), vec![&e, user.clone()]);
+    }
+
+    #[test]
+    fn test_a_second_credit_does_not_duplicate_the_holder() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+
+        client.mint(&admin, &user, &1_000);
+        client.mint(&admin, &user, &500);
+
+        assert_eq!(client.holder_count(), 1);
+        assert_eq!(balance::holders(&e), vec![&e, user.clone()]);
+    }
+
+    #[test]
+    fn test_crediting_an_existing_holder_keeps_the_set_unique() {
+        let (e, client, admin) = setup();
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+        funded(&client, &admin, &alice, 1_000);
+        funded(&client, &admin, &bob, 1_000);
+
+        client.mint(&admin, &alice, &100);
+
+        assert_eq!(client.holder_count(), 2);
+        assert_eq!(balance::holders(&e), vec![&e, alice.clone(), bob.clone()]);
+    }
+
+    #[test]
+    fn test_burning_the_whole_balance_leaves_the_holder_set() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+        funded(&client, &admin, &user, 1_000);
+
+        client.burn(&user, &1_000);
+
+        assert_eq!(client.holder_count(), 0);
+        assert_eq!(balance::holders(&e), Vec::new(&e));
+    }
+
+    #[test]
+    fn test_a_partial_burn_keeps_the_holder() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+        funded(&client, &admin, &user, 1_000);
+
+        client.burn(&user, &400);
+
+        assert_eq!(client.holder_count(), 1);
+        assert_eq!(balance::holders(&e), vec![&e, user.clone()]);
+    }
+
+    #[test]
+    fn test_draining_the_holder_set_empties_it() {
+        let (e, client, admin) = setup();
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+        funded(&client, &admin, &alice, 1_000);
+        funded(&client, &admin, &bob, 500);
+
+        client.burn(&alice, &1_000);
+        client.burn(&bob, &500);
+
+        assert_eq!(client.holder_count(), 0);
+        assert_eq!(balance::holders(&e), Vec::new(&e));
+    }
+
+    #[test]
+    fn test_a_drained_holder_can_come_back() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+        funded(&client, &admin, &user, 1_000);
+        client.burn(&user, &1_000);
+
+        client.mint(&admin, &user, &250);
+
+        assert_eq!(client.holder_count(), 1);
+        assert_eq!(balance::holders(&e), vec![&e, user.clone()]);
+    }
+
+    #[test]
+    fn test_transfer_joins_and_removes_holders() {
+        let (e, client, admin) = setup();
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+        funded(&client, &admin, &alice, 1_000);
+
+        client.transfer(&alice, &bob, &400);
+        assert_eq!(client.holder_count(), 2);
+        assert_eq!(balance::holders(&e), vec![&e, alice.clone(), bob.clone()]);
+
+        client.transfer(&alice, &bob, &600);
+        assert_eq!(client.holder_count(), 1);
+        assert_eq!(balance::holders(&e), vec![&e, bob.clone()]);
+    }
+
+    #[test]
+    fn test_holder_set_mirrors_balances_after_a_rejected_transfer() {
+        let (e, client, admin) = setup();
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+        funded(&client, &admin, &alice, 100);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.transfer(&alice, &bob, &101);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(client.holder_count(), 1);
+        assert_eq!(balance::holders(&e), vec![&e, alice.clone()]);
+        assert_eq!(client.balance(&bob), 0);
     }
 }

@@ -1,4 +1,4 @@
-use soroban_sdk::{contractevent, Address};
+use soroban_sdk::{contractevent, Address, Bytes};
 
 /// New tokens were credited to `to`.
 ///
@@ -37,17 +37,21 @@ pub struct Transfer {
     pub amount: i128,
 }
 
-/// An admin recovered `amount` from `from` without the holder spending it.
+/// Tokens moved from `from` to `to` carrying an opaque memo.
 ///
-/// Topics are `["clawback", admin: Address, from: Address]` and the data is
-/// `[amount: i128]`. The admin is a topic rather than a data field so an
-/// auditor can filter clawbacks by the account that performed them.
+/// Topics are the same `["transfer", from, to]` as [`Transfer`] so a wallet
+/// still recognizes the movement, and the data is `[amount: i128,
+/// memo: Bytes]`. Reusing the `transfer` topic rather than inventing a new one
+/// is deliberate: a memo is extra information about a transfer, not a
+/// different kind of transfer, and a wallet that only knows `transfer` should
+/// still show the ticket moving.
 #[contractevent(data_format = "vec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Clawback {
-    #[topic]
-    pub admin: Address,
+pub struct TransferWithMemo {
     #[topic]
     pub from: Address,
+    #[topic]
+    pub to: Address,
     pub amount: i128,
+    pub memo: Bytes,
 }

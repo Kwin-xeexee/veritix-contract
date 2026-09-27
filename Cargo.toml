@@ -18,6 +18,7 @@ soroban-sdk = { version = "27.0.3", features = ["testutils"] }
 default = []
 testutils = ["soroban-sdk/testutils"]
 testutils = ["soroban-sdk/testutils"]
+testutils = ["soroban-sdk/testutils"]
 name = "veritix-pay"
 version = "0.1.0"
 edition = "2021"
