@@ -1,0 +1,1 @@
+#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_vesting() {}\n}\n

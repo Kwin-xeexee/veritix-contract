@@ -1,0 +1,1 @@
+pub fn get_contract_info() -> &'static str {\n    \"v1.0.0\"\n}\n
