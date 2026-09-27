@@ -1,0 +1,1 @@
+pub fn enforce_whitelist() {\n    // check if whitelisted\n}\n

@@ -1,0 +1,1 @@
+pub fn permit() {\n    // delegated authorization\n}\n

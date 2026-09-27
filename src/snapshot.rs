@@ -1,0 +1,1 @@
+pub fn take_snapshot() {\n    // take snapshot of balances\n}\n
