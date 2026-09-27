@@ -9,11 +9,38 @@
 #[cfg(test)]
 extern crate std;
 
-mod admin;
-mod balance;
-mod contract;
-mod escrow;
-mod events;
-mod metadata;
-mod storage_types;
-mod validation;
+// `soroban-sdk` supplies the wasm `#[panic_handler]`, so this crate must not
+// declare a second one — two handlers in one link are a duplicate `panic_impl`
+// lang item. But a handler is mandatory for a `no_std` wasm module, and the
+// SDK's is only linked once something in the crate actually references it. The
+// crate root is empty until the first module lands, so reference the SDK here
+// to keep its panic handler present at every point in the build. This is an
+// anonymous import: it pulls the dependency in without binding a name, and
+// introduces no unused-import warning.
+use soroban_sdk as _;
+
+// The SDK's handler is gated on `target_family = "wasm"`, so the host library
+// target still has no handler at all. A `#![no_std]` crate built for a host
+// target therefore cannot be built directly, which is why tooling lints the
+// contract with `cargo clippy --lib --target wasm32v1-none` and lints the tests
+// with `cargo clippy --tests` on the host, where `extern crate std` above
+// supplies a handler. See .github/workflows/ci.yml.
+
+// Module declarations are added here as each module lands in the backlog, so
+// that every link in the stack compiles on its own. Test modules stay behind
+// `#[cfg(test)]` and are never compiled into the wasm artifact.
+//
+// `pub mod`, per CONTRIBUTING.md. It also keeps `dead_code` honest: helpers
+// land here before the modules that call them, and a private module would
+// report them as unused the moment they are added. On a `cdylib` contract
+// crate `pub` does not widen the wasm export surface — only `#[contractimpl]`
+// entry points are callable on-chain.
+pub mod admin;
+pub mod contract;
+pub mod dispute;
+pub mod storage_types;
+
+#[cfg(test)]
+mod admin_test;
+#[cfg(test)]
+mod dispute_test;
