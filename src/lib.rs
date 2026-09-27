@@ -64,7 +64,10 @@ use soroban_sdk as _;
 // entry points are callable on-chain.
 pub mod admin;
 pub mod contract;
+pub mod dispute;
 pub mod storage_types;
 
 #[cfg(test)]
 mod admin_test;
+#[cfg(test)]
+mod dispute_test;

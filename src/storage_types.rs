@@ -108,14 +108,30 @@ pub enum DataKey {
     // --- Balances ------------------------------------------------------------
     /// Token balance of a single account.
     Balance(Address),
+    /// Token balance key used by the balance module.
+    BalanceOf(Address),
     /// Spending allowance granted by `owner` to `spender`.
     Allowance(Address, Address),
+    /// The portion of an account's balance held by an active escrow.
+    EscrowLocked(Address),
+
+    // --- Compliance ----------------------------------------------------------
+    /// Whether the whole contract is paused.
+    Paused,
+    /// Whether an account is frozen and cannot move tokens.
+    Frozen(Address),
 
     // --- Supply --------------------------------------------------------------
     /// Total tokens in circulation.
     TotalSupply,
     /// The hard supply cap fixed at initialization, if one was set.
     MaxSupply,
+
+    // --- Escrows and disputes ------------------------------------------------
+    /// An escrow held under its id, for lifecycle and settlement tracking.
+    Escrow(u64),
+    /// The dispute record open over an escrow, keyed by escrow id.
+    Dispute(u64),
 
     // --- Counters ------------------------------------------------------------
     /// A monotonically increasing per-address counter.
@@ -225,7 +241,11 @@ pub enum DisputeStatus {
 /// A dispute raised over a single escrow.
 ///
 /// While a dispute is `Open` or `Appealed` the underlying escrow must not be
-/// released or refunded; that is the whole point of raising one.
+/// released or refunded; that is the whole point of raising one. A ruling
+/// recorded by `resolve_dispute` moves the dispute to `Resolved` with the
+/// payout blocked until the appeal window lapses; if the losing party appeals,
+/// the dispute becomes `Appealed` and only `resolve_appeal` (a final, unappealable
+/// ruling) may settle the escrow.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeRecord {
@@ -239,4 +259,12 @@ pub struct DisputeRecord {
     pub opened_ledger: u32,
     /// The arbiter assigned to settle it, if one has been set.
     pub resolver: Option<Address>,
+    /// Ledger at which the most recent ruling was handed down; `0` if no
+    /// ruling has been recorded yet. Measured against the appeal window.
+    pub resolved_ledger: u32,
+    /// The party declared the winner by the most recent ruling.
+    pub winner: Option<Address>,
+    /// True once an appeal has been resolved. The ruling is then final and a
+    /// second appeal on the same escrow must be rejected.
+    pub is_final: bool,
 }
