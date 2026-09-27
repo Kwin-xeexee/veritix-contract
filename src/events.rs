@@ -26,38 +26,6 @@ pub struct Transfer {
     pub amount: i128,
 }
 
-/// `from` authorized `spender` to move up to `amount` until
-/// `expiration_ledger`.
-///
-/// Topics are `["approve", from: Address, spender: Address]` and the data is
-/// `[amount: i128, expiration_ledger: u32]`. The amount in the data is the
-/// allowance's new total, not the delta, so an indexer replaying the log
-/// reconstructs the current grant without replaying arithmetic.
-#[contractevent(data_format = "vec")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Approve {
-    #[topic]
-    pub from: Address,
-    #[topic]
-    pub spender: Address,
-    pub amount: i128,
-    pub expiration_ledger: u32,
-}
-
-/// `owner` cleared every approval they had granted.
-///
-/// Topics are `["allowances_revoked", owner: Address]` and the data is
-/// `[count: u32]`. The count is in the event rather than only in the return
-/// value so the sweep is auditable from the log, even for a caller that
-/// discarded the return.
-#[contractevent(data_format = "vec")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AllowancesRevoked {
-    #[topic]
-    pub owner: Address,
-    pub count: u32,
-}
-
 /// A new escrow was created.
 ///
 /// Topics are `["escrow_created", depositor: Address, beneficiary: Address]`
@@ -75,4 +43,38 @@ pub struct EscrowCreated {
     pub token: Address,
     pub amount: i128,
     pub deadline_ledger: u32,
+}
+
+/// `amount` of escrow `id` was paid out to its beneficiary.
+///
+/// Topics are `["escrow_released", beneficiary: Address]` and the data is
+/// `[id: u32, amount: i128, remaining: i128]`.
+///
+/// One event covers both full and partial settlement, and `remaining` is what
+/// tells them apart: it is `0` on the call that closes the escrow and positive
+/// on every call before it. A watcher therefore needs one rule — "settled when
+/// `remaining` is 0" — instead of one per entry point, and a partial release is
+/// still visible to anything tracking what the beneficiary has received.
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowReleased {
+    #[topic]
+    pub beneficiary: Address,
+    pub id: u32,
+    pub amount: i128,
+    pub remaining: i128,
+}
+
+/// Escrow `id` was cancelled and `amount` returned to its depositor.
+///
+/// Topics are `["escrow_refunded", depositor: Address]` and the data is
+/// `[id: u32, amount: i128]`. A refund is always terminal, so there is no
+/// `remaining` to report: the escrow is closed by definition.
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRefunded {
+    #[topic]
+    pub depositor: Address,
+    pub id: u32,
+    pub amount: i128,
 }

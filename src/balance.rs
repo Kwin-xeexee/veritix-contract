@@ -120,21 +120,3 @@ pub fn transfer(e: &Env, from: &Address, to: &Address, amount: i128) {
     }
     .publish(e);
 }
-
-/// Moves `amount` from `from` to `to` on `spender`'s authority.
-///
-/// The allowance is reduced first, then this goes through exactly the same
-/// [`transfer`] path. Reducing the allowance up front is what makes a failed
-/// spend cost the spender nothing: the rejection is a panic, and a panic
-/// reverts the whole invocation, so the balance check and the allowance
-/// reduction cannot disagree about whether the spend happened.
-///
-/// # Panics
-///
-/// Panics through [`crate::allowance::consume_allowance`] when the live
-/// allowance is insufficient or expired, and with everything [`transfer`] panics
-/// on.
-pub fn transfer_from(e: &Env, spender: &Address, from: &Address, to: &Address, amount: i128) {
-    crate::allowance::consume_allowance(e, from, spender, amount);
-    transfer(e, from, to, amount);
-}

@@ -10,7 +10,6 @@
 extern crate std;
 
 mod admin;
-mod allowance;
 mod balance;
 mod contract;
 mod escrow;
@@ -18,9 +17,3 @@ mod events;
 mod metadata;
 mod storage_types;
 mod validation;
-
-// The allowance rules that are most likely to regress under a refactor get
-// their own file, so a change to `approve` or `consume_allowance` has an
-// obvious place to be checked against.
-#[cfg(test)]
-mod allowance_test;

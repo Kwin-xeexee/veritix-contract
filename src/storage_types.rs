@@ -23,12 +23,6 @@ pub enum DataKey {
     MaxSupply,
     /// Balance held by a single account.
     BalanceOf(Address),
-    /// Amount `spender` may move on `from`'s behalf.
-    Allowance(Address, Address),
-    /// Ledger at which `Allowance(from, spender)` expires.
-    AllowanceExpiration(Address, Address),
-    /// Every spender `owner` currently has a live allowance with.
-    AllowanceSpenders(Address),
     /// Escrow record keyed by its id.
     EscrowRecord(u32),
     /// Number of escrows ever created; also the next escrow id.
@@ -39,16 +33,25 @@ pub enum DataKey {
 
 /// Where an escrow is in its lifecycle.
 ///
-/// Settlement outcomes land in later issues; `Active` is the only state
-/// `create_escrow` can produce.
+/// `Active` is the only state an escrow can be created in; the other two are
+/// terminal and mutually exclusive, and neither ever returns to `Active`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
-    /// Funds are held and awaiting settlement.
+    /// Funds are still held and the escrow can still be settled.
     Active,
+    /// Settled in the beneficiary's favour.
+    Released,
+    /// Settled in the depositor's favour.
+    Refunded,
 }
 
 /// One escrow: who deposited, who is owed, and under what deadline.
+///
+/// `amount` is the amount still held, not the amount originally deposited. A
+/// partial settlement reduces it, and an escrow is settled only once it reaches
+/// zero, so a record never has to be read alongside the event log to tell how
+/// much is still owed.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowRecord {
