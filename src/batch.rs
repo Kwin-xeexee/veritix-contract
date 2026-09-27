@@ -1,0 +1,1 @@
+pub fn mint_batch() {\n    // batch minting\n}\n

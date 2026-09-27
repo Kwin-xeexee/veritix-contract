@@ -1,0 +1,1 @@
+pub fn calculate_protocol_fee(amount: u64) -> u64 {\n    amount / 100\n}\n

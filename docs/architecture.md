@@ -1,0 +1,1 @@
+# Architecture\n\nExplaining the module boundaries for the Veritix contract.\n
