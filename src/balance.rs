@@ -1,4 +1,4 @@
-use crate::events::{Burn, Mint, Transfer};
+use crate::events::{Mint, Transfer};
 use crate::storage_types::DataKey;
 use crate::validation::require_positive_amount;
 use soroban_sdk::{Address, Env};
@@ -81,17 +81,6 @@ pub fn increase_supply(e: &Env, amount: i128) {
         .set(&DataKey::TotalSupply, &new_supply);
 }
 
-/// Subtracts `amount` from total supply.
-pub fn decrease_supply(e: &Env, amount: i128) {
-    let supply = total_supply(e);
-    let new_supply = supply
-        .checked_sub(amount)
-        .unwrap_or_else(|| panic!("SupplyUnderflow: burning {} would take supply below zero", amount));
-    e.storage()
-        .persistent()
-        .set(&DataKey::TotalSupply, &new_supply);
-}
-
 /// Brings `amount` of new tokens into circulation for `to`.
 ///
 /// This is the only place that credits balances and grows supply together, so
@@ -148,33 +137,4 @@ pub fn transfer(e: &Env, from: &Address, to: &Address, amount: i128) {
 pub fn transfer_from(e: &Env, spender: &Address, from: &Address, to: &Address, amount: i128) {
     crate::allowance::consume_allowance(e, from, spender, amount);
     transfer(e, from, to, amount);
-}
-
-/// Destroys `amount` of the caller's own tokens, reducing balance and supply.
-pub fn burn(e: &Env, from: &Address, amount: i128) {
-    require_positive_amount(amount);
-    debit(e, from, amount);
-    decrease_supply(e, amount);
-    Burn {
-        from: from.clone(),
-        amount,
-    }
-    .publish(e);
-}
-
-/// Destroys `amount` of `from`'s tokens on `spender`'s authority, reducing
-/// balance and supply.
-///
-/// Mirrors [`burn`] but draws on an allowance instead of the holder's signature.
-/// It emits the same `["burn", from]` event: the tokens left `from`'s account
-/// either way, and an indexer rebuilding balances from the event log should not
-/// have to care which signature was used.
-///
-/// # Panics
-///
-/// Panics through [`crate::allowance::consume_allowance`] when the live
-/// allowance is insufficient or expired, and with everything [`burn`] panics on.
-pub fn burn_from(e: &Env, spender: &Address, from: &Address, amount: i128) {
-    crate::allowance::consume_allowance(e, from, spender, amount);
-    burn(e, from, amount);
 }

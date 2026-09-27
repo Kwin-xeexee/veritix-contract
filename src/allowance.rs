@@ -1,13 +1,14 @@
-use crate::events::Approve;
+use crate::events::{AllowancesRevoked, Approve};
 use crate::storage_types::DataKey;
-use soroban_sdk::{contracttype, Address, Env};
+use crate::validation::require_positive_amount;
+use soroban_sdk::{contracttype, Address, Env, Vec};
 
 /// A live allowance: how much, and until when.
 ///
-/// `#[contracttype]` is what makes this storable: the derive supplies the
-/// `Val` conversions that `Env::storage` needs, and the pair travels as one
-/// atomic value so a reader can never observe an amount from one grant beside
-/// an expiration from another.
+/// `#[contracttype]` is what makes this storable: the derive supplies the `Val`
+/// conversions `Env::storage` needs, and the pair travels as one atomic value,
+/// so a reader can never see an amount from one grant beside an expiration from
+/// another.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Allowance {
@@ -27,43 +28,13 @@ fn load(e: &Env, from: &Address, spender: &Address) -> Allowance {
 }
 
 /// Whether `stored` has already lapsed.
-///
-/// An allowance is expired once `expiration_ledger` is strictly behind the
-/// current ledger, so it is still live on the ledger it expires on.
 fn is_expired(e: &Env, stored: &Allowance) -> bool {
     stored.expiration_ledger < e.ledger().sequence()
 }
 
-/// Writes an allowance, or deletes the entry when `amount` is zero.
-fn store(e: &Env, from: &Address, spender: &Address, amount: i128, expiration_ledger: u32) {
-    if amount == 0 {
-        e.storage()
-            .persistent()
-            .remove(&DataKey::Allowance(from.clone(), spender.clone()));
-        e.storage()
-            .persistent()
-            .remove(&DataKey::AllowanceExpiration(from.clone(), spender.clone()));
-    } else {
-        e.storage().persistent().set(
-            &DataKey::Allowance(from.clone(), spender.clone()),
-            &Allowance {
-                amount,
-                expiration_ledger,
-            },
-        );
-        e.storage().persistent().set(
-            &DataKey::AllowanceExpiration(from.clone(), spender.clone()),
-            &expiration_ledger,
-        );
-    }
-}
-
 /// The amount `spender` may still move on `from`'s behalf.
 ///
-/// An expired allowance reads as `0` rather than as an error. A spender that
-/// never spends gets nothing back, which is the whole point of an expiration,
-/// and a UI polling this view gets a number it can act on instead of a failure
-/// it has to special-case.
+/// An expired allowance reads as `0` rather than as an error.
 pub fn allowance(e: &Env, from: &Address, spender: &Address) -> i128 {
     let stored = load(e, from, spender);
     if is_expired(e, &stored) {
@@ -74,10 +45,6 @@ pub fn allowance(e: &Env, from: &Address, spender: &Address) -> i128 {
 }
 
 /// The ledger at which the `from`/`spender` allowance expires.
-///
-/// Reports the stored value even once the allowance has lapsed, so a caller can
-/// tell "expired at ledger 500" apart from "never granted". The amount alone
-/// cannot make that distinction: both read as `0`.
 pub fn allowance_expiration(e: &Env, from: &Address, spender: &Address) -> u32 {
     e.storage()
         .persistent()
@@ -85,12 +52,75 @@ pub fn allowance_expiration(e: &Env, from: &Address, spender: &Address) -> u32 {
         .unwrap_or(0)
 }
 
-/// Authorizes `spender` to move up to `amount` of `from`'s tokens.
+/// Every spender `owner` currently holds a live allowance with, in grant order.
+pub fn spenders_for(e: &Env, owner: &Address) -> Vec<Address> {
+    e.storage()
+        .persistent()
+        .get(&DataKey::AllowanceSpenders(owner.clone()))
+        .unwrap_or_else(|| Vec::new(e))
+}
+
+/// Adds `spender` to `owner`'s index unless it is already a member.
 ///
-/// Overwrites rather than accumulates, so a spender handed a new number cannot
-/// end up with the old one plus the new one. Use [`increase_allowance`] and
-/// [`decrease_allowance`] to adjust an existing grant without the re-approval
-/// race.
+/// A repeated approval must not append a second entry: the index is what
+/// `revoke_all_allowances` walks, and a duplicate would make it report and
+/// rewrite a spender twice.
+fn add_spender(e: &Env, owner: &Address, spender: &Address) {
+    let mut index = spenders_for(e, owner);
+    if !index.contains(spender.clone()) {
+        index.push_back(spender.clone());
+        e.storage()
+            .persistent()
+            .set(&DataKey::AllowanceSpenders(owner.clone()), &index);
+    }
+}
+
+/// Removes `spender` from `owner`'s index if it is a member.
+fn remove_spender(e: &Env, owner: &Address, spender: &Address) {
+    let mut index = spenders_for(e, owner);
+    if let Some(position) = index.first_index_of(spender.clone()) {
+        index.remove(position);
+        e.storage()
+            .persistent()
+            .set(&DataKey::AllowanceSpenders(owner.clone()), &index);
+    }
+}
+
+/// Writes an allowance, keeping `owner`'s spender index in step.
+///
+/// The index is maintained here rather than at the call sites. It is the only
+/// way to enumerate an owner's approvals, so a grant that is not indexed cannot
+/// be found, audited, or revoked in bulk — and an unindexed grant is exactly the
+/// one a user who suspects a compromise cannot shut off. Keeping the write in
+/// one function makes it impossible to store an allowance without indexing it.
+fn store(e: &Env, owner: &Address, spender: &Address, amount: i128, expiration_ledger: u32) {
+    if amount == 0 {
+        e.storage()
+            .persistent()
+            .remove(&DataKey::Allowance(owner.clone(), spender.clone()));
+        e.storage()
+            .persistent()
+            .remove(&DataKey::AllowanceExpiration(owner.clone(), spender.clone()));
+        remove_spender(e, owner, spender);
+    } else {
+        e.storage().persistent().set(
+            &DataKey::Allowance(owner.clone(), spender.clone()),
+            &Allowance {
+                amount,
+                expiration_ledger,
+            },
+        );
+        e.storage().persistent().set(
+            &DataKey::AllowanceExpiration(owner.clone(), spender.clone()),
+            &expiration_ledger,
+        );
+        add_spender(e, owner, spender);
+    }
+}
+
+/// Authorizes `spender` to move up to `amount` of `owner`'s tokens.
+///
+/// Overwrites rather than accumulating, and indexes the spender on the way in.
 ///
 /// # Panics
 ///
@@ -99,7 +129,7 @@ pub fn allowance_expiration(e: &Env, from: &Address, spender: &Address) -> u32 {
 /// always accepted, because revoking an allowance has no expiry to get wrong.
 pub fn approve(
     e: &Env,
-    from: &Address,
+    owner: &Address,
     spender: &Address,
     amount: i128,
     expiration_ledger: u32,
@@ -107,14 +137,14 @@ pub fn approve(
     require_non_negative(amount);
     if amount > 0 && expiration_ledger < e.ledger().sequence() {
         panic!(
-            "ExpirationInPast: expiration ledger {} is not after the current ledger {}",
+            "ExpirationInPast: expiration ledger {} is before the current ledger {}",
             expiration_ledger,
             e.ledger().sequence()
         );
     }
-    store(e, from, spender, amount, expiration_ledger);
+    store(e, owner, spender, amount, expiration_ledger);
     Approve {
-        from: from.clone(),
+        from: owner.clone(),
         spender: spender.clone(),
         amount,
         expiration_ledger,
@@ -122,20 +152,21 @@ pub fn approve(
     .publish(e);
 }
 
-/// Reduces the `from`/`spender` allowance by `amount` and returns what is left.
+/// Reduces the `owner`/`spender` allowance by exactly `amount` and returns what
+/// is left.
 ///
-/// Callers run this before moving anything, so a rejected invocation spends no
-/// allowance. Because every rejection is a panic and a panic reverts the whole
-/// invocation, the ordering is a question of which error a caller sees rather
-/// than of what survives.
+/// The live allowance is read through [`allowance`], so an expired grant counts
+/// as `0` and fails here. The stored expiration is written back unchanged, so a
+/// partial spend does not slide the deadline.
 ///
 /// # Panics
 ///
-/// Panics with `InsufficientAllowance` when the live allowance is below
-/// `amount`. An expired allowance is a live allowance of `0`, so spending one
-/// fails here rather than later.
-pub fn consume_allowance(e: &Env, from: &Address, spender: &Address, amount: i128) -> i128 {
-    let current = allowance(e, from, spender);
+/// Panics through [`require_positive_amount`] on a non-positive `amount` — a
+/// negative amount would otherwise *increase* the grant, since subtracting it
+/// — and with `InsufficientAllowance` when the live allowance is below `amount`.
+pub fn consume_allowance(e: &Env, owner: &Address, spender: &Address, amount: i128) -> i128 {
+    require_positive_amount(amount);
+    let current = allowance(e, owner, spender);
     if current < amount {
         panic!(
             "InsufficientAllowance: {} available, {} required",
@@ -143,74 +174,48 @@ pub fn consume_allowance(e: &Env, from: &Address, spender: &Address, amount: i12
         );
     }
     let remaining = current - amount;
-    store(e, from, spender, remaining, allowance_expiration(e, from, spender));
+    store(
+        e,
+        owner,
+        spender,
+        remaining,
+        allowance_expiration(e, owner, spender),
+    );
     remaining
 }
 
-/// Raises the `from`/`spender` allowance by `amount`, keeping its expiration.
+/// Zeroes every allowance `owner` granted, in one call, and returns how many were
+/// revoked.
 ///
-/// Adjusting by a delta rather than overwriting avoids the re-approval race: two
-/// clients changing the same grant concurrently cannot lose an update, because
-/// neither has to read the current value first and write it back.
-///
-/// # Panics
-///
-/// Panics with `NoAllowance` when the live allowance is `0` — either never
-/// granted or already expired. There is no expiration left to preserve, and
-/// quietly inventing a standing grant with no expiry is exactly the risk an
-/// expiration exists to bound. Call `approve` instead.
-pub fn increase_allowance(e: &Env, from: &Address, spender: &Address, amount: i128) -> i128 {
-    require_positive_delta(amount);
-    let current = allowance(e, from, spender);
-    if current == 0 {
-        panic!("NoAllowance: call approve before adjusting an allowance");
-    }
-    let new_amount = current
-        .checked_add(amount)
-        .unwrap_or_else(|| panic!("AllowanceOverflow: {} + {} overflows", current, amount));
-    let expiration = allowance_expiration(e, from, spender);
-    store(e, from, spender, new_amount, expiration);
-    Approve {
-        from: from.clone(),
-        spender: spender.clone(),
-        amount: new_amount,
-        expiration_ledger: expiration,
-    }
-    .publish(e);
-    new_amount
-}
-
-/// Lowers the `from`/`spender` allowance by `amount`, keeping its expiration.
-///
-/// Saturates at zero instead of underflowing: reducing an allowance is how a
-/// holder pulls back authority, and "reduce by more than I granted" must not
-/// fail or wrap into a huge grant. A reduction to zero revokes the allowance
-/// outright.
-///
-/// A live allowance of `0` — never granted, or already expired — is a no-op
-/// returning `0` rather than a failure. Pulling authority back is idempotent
-/// and safe to retry, and there is nothing left to reduce.
+/// The spender index is the entire point: without it there is no way to
+/// enumerate an owner's approvals, so a user who suspects a compromise would
+/// have to already know every spender by name. The index is walked and each
+/// allowance is zeroed, and the index itself is cleared last.
 ///
 /// # Panics
 ///
-/// Panics with `InvalidAmount` when `amount` is not strictly positive.
-pub fn decrease_allowance(e: &Env, from: &Address, spender: &Address, amount: i128) -> i128 {
-    require_positive_delta(amount);
-    let current = allowance(e, from, spender);
-    if current == 0 {
-        return 0;
+/// Panics if the owner is not the caller; the contract cannot clear someone
+/// else's approvals on their behalf.
+pub fn revoke_all_allowances(e: &Env, owner: &Address) -> u32 {
+    let index = spenders_for(e, owner);
+    let revoked = index.len();
+    for spender in index.iter() {
+        e.storage()
+            .persistent()
+            .remove(&DataKey::Allowance(owner.clone(), spender.clone()));
+        e.storage()
+            .persistent()
+            .remove(&DataKey::AllowanceExpiration(owner.clone(), spender.clone()));
     }
-    let new_amount = current.saturating_sub(amount);
-    let expiration = allowance_expiration(e, from, spender);
-    store(e, from, spender, new_amount, expiration);
-    Approve {
-        from: from.clone(),
-        spender: spender.clone(),
-        amount: new_amount,
-        expiration_ledger: expiration,
+    e.storage()
+        .persistent()
+        .remove(&DataKey::AllowanceSpenders(owner.clone()));
+    AllowancesRevoked {
+        owner: owner.clone(),
+        count: revoked,
     }
     .publish(e);
-    new_amount
+    revoked
 }
 
 /// Rejects a negative `amount`, allowing the zero that means "revoke".
@@ -218,15 +223,6 @@ fn require_non_negative(amount: i128) -> () {
     assert!(
         amount >= 0,
         "InvalidAmount: amount must not be negative, got {}",
-        amount
-    );
-}
-
-/// Rejects a delta that is not strictly positive.
-fn require_positive_delta(amount: i128) -> () {
-    assert!(
-        amount > 0,
-        "InvalidAmount: delta must be strictly positive, got {}",
         amount
     );
 }

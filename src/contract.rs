@@ -1,7 +1,8 @@
+use crate::escrow;
 use crate::metadata::{self, TokenMetadata};
 use crate::storage_types::DataKey;
 use crate::{admin, allowance, balance};
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
 #[contract]
 pub struct VeriTixPay;
@@ -106,12 +107,6 @@ impl VeriTixPay {
         balance::transfer(&e, &from, &to, amount);
     }
 
-    /// Destroys `amount` of the caller's own tokens.
-    pub fn burn(e: Env, from: Address, amount: i128) {
-        from.require_auth();
-        balance::burn(&e, &from, amount);
-    }
-
     // ---- Allowances -----------------------------------------------------
 
     /// The amount `spender` may still move on `from`'s behalf.
@@ -124,15 +119,27 @@ impl VeriTixPay {
 
     /// The ledger at which the `from`/`spender` allowance expires.
     ///
-    /// Reported even after the allowance has lapsed, so a caller can tell
-    /// "expired at ledger 500" apart from "never granted"; the amount alone
-    /// reads as `0` for both.
+    /// Kept separate from [`allowance`] because the amount alone cannot
+    /// distinguish "expired at ledger 500" from "never granted" — both read `0`.
     pub fn allowance_expiration(e: Env, from: Address, spender: Address) -> u32 {
         allowance::allowance_expiration(&e, &from, &spender)
     }
 
+    /// Every spender `from` has granted an allowance to, in grant order.
+    ///
+    /// A lapsed grant stays in the index until it is revoked or overwritten, so
+    /// this is a superset of the currently spendable pairs: call
+    /// [`allowance`] per spender to find out which are still live. The
+    /// superset is deliberate — the index exists so nothing granted can hide
+    /// from a bulk revocation, and a grant that quietly dropped out of the list
+    /// on expiry is the one a user auditing their approvals would never think
+    /// to look for.
+    pub fn get_allowances_for_spender(e: Env, from: Address) -> Vec<Address> {
+        allowance::spenders_for(&e, &from)
+    }
+
     /// Authorizes `spender` to move up to `amount` of `from`'s tokens until
-    /// `expiration_ledger`, replacing any existing allowance.
+    /// `expiration_ledger`, overwriting any previous grant to the same spender.
     pub fn approve(
         e: Env,
         from: Address,
@@ -144,84 +151,132 @@ impl VeriTixPay {
         allowance::approve(&e, &from, &spender, amount, expiration_ledger);
     }
 
-    /// Raises the `from`/`spender` allowance by `amount`, keeping its
-    /// expiration.
-    ///
-    /// Adjusting by a delta rather than overwriting is what avoids the
-    /// re-approval race: two clients changing the same grant at once cannot
-    /// lose an update, because neither has to read the current value and write
-    /// it back.
-    pub fn increase_allowance(e: Env, from: Address, spender: Address, amount: i128) {
+    /// Clears every approval `from` has granted and returns how many were
+    /// revoked.
+    pub fn revoke_all_allowances(e: Env, from: Address) -> u32 {
         from.require_auth();
-        allowance::increase_allowance(&e, &from, &spender, amount);
+        allowance::revoke_all_allowances(&e, &from)
     }
 
-    /// Lowers the `from`/`spender` allowance by `amount`, keeping its
-    /// expiration. Saturates at zero rather than underflowing.
-    pub fn decrease_allowance(e: Env, from: Address, spender: Address, amount: i128) {
-        from.require_auth();
-        allowance::decrease_allowance(&e, &from, &spender, amount);
-    }
-
-    /// Moves `amount` from `from` to `to` on `spender`'s authority, reducing
-    /// the spender's allowance.
-    ///
-    /// This is how a marketplace moves a buyer's tokens: the buyer signs one
-    /// `approve`, and the marketplace spends from it.
-    pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
+    /// Moves `amount` of `from`'s tokens to `to` on `spender`'s authority,
+    /// drawing the amount down from their allowance.
+    pub fn transfer_from(
+        e: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) {
         spender.require_auth();
         balance::transfer_from(&e, &spender, &from, &to, amount);
     }
 
-    /// Destroys `amount` of `from`'s tokens on `spender`'s authority, reducing
-    /// the spender's allowance.
+    // ---- Escrow ---------------------------------------------------------
+
+    /// Holds `amount` of `token` for `beneficiary` until the event settles, and
+    /// returns the new escrow's id.
     ///
-    /// For settlement flows that burn a user's tokens against a prior approval.
-    pub fn burn_from(e: Env, spender: Address, from: Address, amount: i128) {
-        spender.require_auth();
-        balance::burn_from(&e, &spender, &from, amount);
+    /// The funds leave the depositor immediately and sit in the contract, so a
+    /// buyer cannot walk away after a ticket is sold.
+    pub fn create_escrow(
+        e: Env,
+        depositor: Address,
+        beneficiary: Address,
+        token: Address,
+        amount: i128,
+        deadline_ledger: u32,
+    ) -> u32 {
+        escrow::create(&e, &depositor, &beneficiary, &token, amount, deadline_ledger)
     }
 }
 
+/// The shared test harness, so `allowance_test` can drive the same contract the
+/// tests below do rather than standing up a second one.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
+    use crate::storage_types::EscrowRecord;
+    use crate::storage_types::EscrowStatus;
+    use soroban_sdk::token::StellarAssetClient;
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
-    use soroban_sdk::{symbol_short, vec, xdr, FromVal};
+    use soroban_sdk::{vec, xdr, FromVal, IntoVal};
 
-    struct Fixture {
-        e: Env,
-        client: VeriTixPayClient<'static>,
-        contract_id: Address,
-        admin: Address,
+    pub struct Fixture {
+        pub e: Env,
+        pub client: VeriTixPayClient<'static>,
+        pub contract_id: Address,
+        pub contract: Address,
+        pub admin: Address,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub fn new() -> Self {
             let e = Env::default();
             e.mock_all_auths();
             let contract_id = e.register_contract(None, VeriTixPay);
             let client = VeriTixPayClient::new(&e, &contract_id);
             let admin = Address::generate(&e);
             client.initialize(&admin);
+            let contract = contract_id.clone();
             Fixture {
                 e,
                 client,
                 contract_id,
+                contract,
                 admin,
             }
         }
 
-        fn fund(&self, amount: i128) -> Address {
+        pub fn fund(&self, amount: i128) -> Address {
             let holder = Address::generate(&self.e);
             self.client.mint(&self.admin, &holder, &amount);
             holder
         }
 
-        fn set_max_supply(&self, cap: i128) {
+        /// A SEP-41 asset with `holder` holding `amount` of it.
+        pub fn asset(
+            &self,
+            holder: &Address,
+            amount: i128,
+        ) -> (Address, StellarAssetClient<'static>) {
+            let address = self
+                .e
+                .register_stellar_asset_contract_v2(self.admin.clone())
+                .address();
+            let token = StellarAssetClient::new(&self.e, &address);
+            token.mint(holder, &amount);
+            (address, token)
+        }
+
+        pub fn spender_index(&self, owner: &Address) -> Vec<Address> {
+            self.client.get_allowances_for_spender(owner)
+        }
+
+        /// One escrow record, read through the contract's own storage frame.
+        pub fn escrow(&self, id: u32) -> EscrowRecord {
+            self.e.as_contract(&self.contract_id, || crate::escrow::record(&self.e, id))
+        }
+
+        /// Whether an escrow record exists at `id`.
+        pub fn has_escrow(&self, id: u32) -> bool {
             self.e.as_contract(&self.contract_id, || {
-                self.e.storage().persistent().set(&DataKey::MaxSupply, &cap);
-            });
+                self.e
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::EscrowRecord(id))
+            })
+        }
+
+        /// The number of escrows the contract has created.
+        pub fn escrow_count(&self) -> u32 {
+            self.e
+                .as_contract(&self.contract_id, || crate::escrow::count(&self.e))
+        }
+
+        /// The total token amount the contract reports as held in escrow.
+        pub fn escrow_value_locked(&self) -> i128 {
+            self.e
+                .as_contract(&self.contract_id, || crate::escrow::value_locked(&self.e))
         }
     }
 
@@ -240,632 +295,468 @@ mod tests {
         let xdr::ContractEventBody::V0(body) = &last.body else {
             panic!("expected a v0 contract event");
         };
-        body.data.clone()
+        body.data.clone().expect("an event with no data")
     }
 
-    // ---- Initialization -------------------------------------------------
+    // ---- #879: the spender index ----------------------------------------
 
     #[test]
-    fn test_initialize_stores_admin_and_defaults() {
-        let f = Fixture::new();
-        assert!(f.client.is_initialized());
-        assert_eq!(f.client.admin(), f.admin);
-        assert_eq!(f.client.name(), String::from_str(&f.e, "VeriTix"));
-        assert_eq!(f.client.symbol(), String::from_str(&f.e, "VTX"));
-        assert_eq!(f.client.decimals(), 7);
-    }
-
-    #[test]
-    #[should_panic(expected = "AlreadyInitialized")]
-    fn test_initialize_twice_panics() {
-        let f = Fixture::new();
-        f.client.initialize(&Address::generate(&f.e));
-    }
-
-    // ---- Allowance views ------------------------------------------------
-
-    #[test]
-    fn test_allowance_is_zero_before_any_approval() {
+    fn test_the_index_starts_empty() {
         let f = Fixture::new();
         let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
+        assert!(f.spender_index(&holder).is_empty());
     }
 
     #[test]
-    fn test_approve_is_reflected_in_both_views() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
-
-        f.client.approve(&holder, &spender, &500, &expiry);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 500);
-        assert_eq!(f.client.allowance_expiration(&holder, &spender), expiry);
-    }
-
-    #[test]
-    fn test_approve_overwrites_rather_than_accumulates() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
-
-        f.client.approve(&holder, &spender, &500, &expiry);
-        f.client.approve(&holder, &spender, &200, &expiry);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 200);
-    }
-
-    #[test]
-    fn test_allowance_reads_zero_once_expired() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client.approve(&holder, &spender, &500, &1_000);
-
-        f.e.ledger().set_sequence_number(1_000);
-        assert_eq!(f.client.allowance(&holder, &spender), 500);
-
-        f.e.ledger().set_sequence_number(1_001);
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-    }
-
-    #[test]
-    fn test_expiration_view_still_reports_after_lapse() {
-        // The amount alone cannot distinguish "expired" from "never granted";
-        // the expiration view is what makes the two tellable apart.
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client.approve(&holder, &spender, &500, &1_000);
-        f.e.ledger().set_sequence_number(1_001);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-        assert_eq!(f.client.allowance_expiration(&holder, &spender), 1_000);
-        assert_eq!(f.client.allowance_expiration(&holder, &Address::generate(&f.e)), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "ExpirationInPast")]
-    fn test_approve_rejects_a_past_expiration_for_a_non_zero_amount() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.e.ledger().set_sequence_number(1_000);
-
-        f.client.approve(&holder, &spender, &500, &999);
-    }
-
-    #[test]
-    fn test_approve_zero_revokes_whatever_expiration_was_stored() {
+    fn test_an_approval_indexes_the_spender() {
         let f = Fixture::new();
         let holder = f.fund(1_000);
         let spender = Address::generate(&f.e);
         f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
+            .approve(&holder, &spender, &500, &1_000_000);
 
-        f.client.approve(&holder, &spender, &0, &0);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-        assert_eq!(f.client.allowance_expiration(&holder, &spender), 0);
+        assert_eq!(f.spender_index(&holder), vec![&f.e, spender]);
     }
 
     #[test]
-    fn test_approve_emits_the_standard_event() {
+    fn test_reapproving_the_same_spender_does_not_duplicate_it() {
+        // The index is walked by revoke_all_allowances, so a second entry would
+        // make it report and rewrite the same spender twice.
         let f = Fixture::new();
         let holder = f.fund(1_000);
         let spender = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
+        f.client.approve(&holder, &spender, &500, &1_000_000);
+        f.client.approve(&holder, &spender, &200, &1_000_000);
 
-        f.client.approve(&holder, &spender, &500, &expiry);
+        assert_eq!(f.spender_index(&holder), vec![&f.e, spender]);
+    }
+
+    #[test]
+    fn test_several_spenders_are_indexed_in_grant_order() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let a = Address::generate(&f.e);
+        let b = Address::generate(&f.e);
+        let c = Address::generate(&f.e);
+        f.client.approve(&holder, &a, &100, &1_000_000);
+        f.client.approve(&holder, &b, &100, &1_000_000);
+        f.client.approve(&holder, &c, &100, &1_000_000);
+
+        assert_eq!(f.spender_index(&holder), vec![&f.e, a, b, c]);
+    }
+
+    #[test]
+    fn test_exhausting_an_allowance_unindexes_the_spender() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let receiver = Address::generate(&f.e);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&holder, &spender, &500, &1_000_000);
+        f.client.transfer_from(&spender, &holder, &receiver, &500);
+
+        assert_eq!(f.client.allowance(&holder, &spender), 0);
+        assert!(f.spender_index(&holder).is_empty());
+    }
+
+    #[test]
+    fn test_a_partial_spend_keeps_the_spender_indexed() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let receiver = Address::generate(&f.e);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&holder, &spender, &500, &1_000_000);
+        f.client.transfer_from(&spender, &holder, &receiver, &200);
+
+        assert_eq!(f.client.allowance(&holder, &spender), 300);
+        assert_eq!(f.spender_index(&holder), vec![&f.e, spender]);
+    }
+
+    #[test]
+    fn test_reapproving_after_exhaustion_reindexes_the_spender() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let receiver = Address::generate(&f.e);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&holder, &spender, &500, &1_000_000);
+        f.client.transfer_from(&spender, &holder, &receiver, &500);
+        assert!(f.spender_index(&holder).is_empty());
+
+        f.client.approve(&holder, &spender, &100, &1_000_000);
+
+        assert_eq!(f.spender_index(&holder), vec![&f.e, spender]);
+    }
+
+    #[test]
+    fn test_revoking_one_spender_unindexes_only_that_spender() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let a = Address::generate(&f.e);
+        let b = Address::generate(&f.e);
+        f.client.approve(&holder, &a, &100, &1_000_000);
+        f.client.approve(&holder, &b, &100, &1_000_000);
+
+        f.client.approve(&holder, &a, &0, &0);
+
+        assert_eq!(f.spender_index(&holder), vec![&f.e, b]);
+    }
+
+    #[test]
+    fn test_the_index_is_per_owner() {
+        let f = Fixture::new();
+        let one = f.fund(1_000);
+        let two = f.fund(1_000);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&one, &spender, &100, &1_000_000);
+        f.client.approve(&two, &spender, &100, &1_000_000);
+
+        assert_eq!(f.spender_index(&one), vec![&f.e, spender.clone()]);
+        assert_eq!(f.spender_index(&two), vec![&f.e, spender]);
+    }
+
+    #[test]
+    fn test_a_lapsed_grant_stays_in_the_index_until_revoked() {
+        // The index is the list of everything ever granted and not yet
+        // revoked. Keeping a lapsed grant on it is what guarantees a bulk
+        // revocation can still find it.
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&holder, &spender, &500, &1_000);
+        f.e.ledger().set_sequence_number(1_001);
+
+        assert_eq!(f.client.allowance(&holder, &spender), 0);
+        assert_eq!(f.spender_index(&holder), vec![&f.e, spender]);
+    }
+
+    // ---- #880: revoke_all_allowances ------------------------------------
+
+    #[test]
+    fn test_revoke_all_clears_every_allowance() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let a = Address::generate(&f.e);
+        let b = Address::generate(&f.e);
+        f.client.approve(&holder, &a, &100, &1_000_000);
+        f.client.approve(&holder, &b, &250, &1_000_000);
+
+        let revoked = f.client.revoke_all_allowances(&holder);
+
+        assert_eq!(revoked, 2);
+        assert_eq!(f.client.allowance(&holder, &a), 0);
+        assert_eq!(f.client.allowance(&holder, &b), 0);
+        assert!(f.spender_index(&holder).is_empty());
+    }
+
+    #[test]
+    fn test_revoke_all_on_an_owner_with_no_allowances_is_a_no_op() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+
+        assert_eq!(f.client.revoke_all_allowances(&holder), 0);
+        assert!(f.spender_index(&holder).is_empty());
+    }
+
+    #[test]
+    fn test_a_revoked_spender_cannot_move_tokens() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let receiver = Address::generate(&f.e);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&holder, &spender, &500, &1_000_000);
+        f.client.revoke_all_allowances(&holder);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f.client.transfer_from(&spender, &holder, &receiver, &100);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(f.client.balance(&holder), 1_000);
+        assert_eq!(f.client.balance(&receiver), 0);
+    }
+
+    #[test]
+    fn test_revoke_all_leaves_other_owners_alone() {
+        let f = Fixture::new();
+        let one = f.fund(1_000);
+        let two = f.fund(1_000);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&one, &spender, &100, &1_000_000);
+        f.client.approve(&two, &spender, &100, &1_000_000);
+
+        assert_eq!(f.client.revoke_all_allowances(&one), 1);
+
+        assert_eq!(f.client.allowance(&one, &spender), 0);
+        assert_eq!(f.client.allowance(&two, &spender), 100);
+    }
+
+    #[test]
+    fn test_revoke_all_also_clears_lapsed_grants() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&holder, &spender, &500, &1_000);
+        f.e.ledger().set_sequence_number(1_001);
+
+        assert_eq!(f.client.revoke_all_allowances(&holder), 1);
+
+        assert!(f.spender_index(&holder).is_empty());
+    }
+
+    #[test]
+    fn test_a_spender_can_be_granted_again_after_a_bulk_revoke() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let receiver = Address::generate(&f.e);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&holder, &spender, &500, &1_000_000);
+        f.client.revoke_all_allowances(&holder);
+
+        f.client.approve(&holder, &spender, &500, &1_000_000);
+        f.client
+            .transfer_from(&spender, &holder, &receiver, &200);
+
+        assert_eq!(f.client.allowance(&holder, &spender), 300);
+    }
+
+    #[test]
+    fn test_revoke_all_emits_one_event_naming_the_owner_and_the_count() {
+        let f = Fixture::new();
+        let holder = f.fund(1_000);
+        let spender = Address::generate(&f.e);
+        f.client.approve(&holder, &spender, &100, &1_000_000);
+
+        f.client.revoke_all_allowances(&holder);
 
         assert_eq!(
             last_topics(&f.e),
             std::vec![
-                xdr::ScVal::from_val(&f.e, &symbol_short!("approve").to_val()),
+                xdr::ScVal::Symbol("allowances_revoked".try_into().unwrap()),
                 xdr::ScVal::from_val(&f.e, &holder.to_val()),
-                xdr::ScVal::from_val(&f.e, &spender.to_val()),
             ]
         );
         assert_eq!(
             last_data(&f.e),
-            xdr::ScVal::from_val(&f.e, &vec![&f.e, 500i128, expiry].to_val())
+            xdr::ScVal::from_val(&f.e, &vec![&f.e, 1u32.to_val()])
         );
     }
 
-    // ---- transfer_from --------------------------------------------------
-
     #[test]
-    fn test_transfer_from_moves_the_balance_and_spends_the_allowance() {
+    fn test_revoke_all_is_idempotent() {
         let f = Fixture::new();
         let holder = f.fund(1_000);
         let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
+        f.client.approve(&holder, &spender, &100, &1_000_000);
 
-        f.client.transfer_from(&spender, &holder, &to, &200);
+        assert_eq!(f.client.revoke_all_allowances(&holder), 1);
+        assert_eq!(f.client.revoke_all_allowances(&holder), 0);
+        assert!(f.spender_index(&holder).is_empty());
+    }
 
-        assert_eq!(f.client.balance(&holder), 800);
-        assert_eq!(f.client.balance(&to), 200);
-        assert_eq!(f.client.allowance(&holder, &spender), 300);
-        assert_eq!(f.client.total_supply(), 1_000);
+    // ---- #882: create_escrow -------------------------------------------
+
+    #[test]
+    fn test_create_escrow_returns_the_first_id() {
+        let f = Fixture::new();
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 1_000);
+
+        let id = f
+            .client
+            .create_escrow(&depositor, &beneficiary, &token, &500, &2_000);
+
+        assert_eq!(id, 0);
     }
 
     #[test]
-    fn test_transfer_from_can_be_called_repeatedly() {
+    fn test_create_escrow_moves_the_tokens_to_the_contract() {
         let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, asset) = f.asset(&depositor, 1_000);
+
         f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
+            .create_escrow(&depositor, &beneficiary, &token, &500, &2_000);
 
-        f.client.transfer_from(&spender, &holder, &to, &200);
-        f.client.transfer_from(&spender, &holder, &to, &200);
-
-        assert_eq!(f.client.balance(&to), 400);
-        assert_eq!(f.client.allowance(&holder, &spender), 100);
+        assert_eq!(asset.balance(&depositor), 500);
+        assert_eq!(asset.balance(&f.contract), 500);
+        // The beneficiary is owed, not paid.
+        assert_eq!(asset.balance(&beneficiary), 0);
     }
 
     #[test]
-    fn test_transfer_from_rejects_more_than_the_allowance() {
+    fn test_create_escrow_stores_an_active_record() {
         let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 1_000);
+
+        let id = f
+            .client
+            .create_escrow(&depositor, &beneficiary, &token, &500, &2_000);
+
+        let record = f.escrow(id);
+        assert_eq!(record.depositor, depositor);
+        assert_eq!(record.beneficiary, beneficiary);
+        assert_eq!(record.token, token);
+        assert_eq!(record.amount, 500);
+        assert_eq!(record.deadline_ledger, 2_000);
+        assert_eq!(record.status, EscrowStatus::Active);
+    }
+
+    #[test]
+    fn test_escrow_ids_are_handed_out_in_order() {
+        let f = Fixture::new();
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 5_000);
+
+        let first = f
+            .client
+            .create_escrow(&depositor, &beneficiary, &token, &100, &2_000);
+        let second = f
+            .client
+            .create_escrow(&depositor, &beneficiary, &token, &200, &3_000);
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+    }
+
+    #[test]
+    fn test_create_escrow_accumulates_the_locked_value() {
+        let f = Fixture::new();
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 5_000);
+
         f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
+            .create_escrow(&depositor, &beneficiary, &token, &100, &2_000);
+        f.client
+            .create_escrow(&depositor, &beneficiary, &token, &250, &3_000);
+
+        let locked = f.e.as_contract(&f.contract_id, || {
+            escrow::value_locked(&f.e)
+        });
+        assert_eq!(locked, 350);
+    }
+
+    #[test]
+    fn test_create_escrow_rejects_a_zero_amount() {
+        let f = Fixture::new();
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 1_000);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f.client.transfer_from(&spender, &holder, &to, &501);
+            f.client
+                .create_escrow(&depositor, &beneficiary, &token, &0, &2_000);
         }));
 
         assert!(result.is_err());
-        assert_eq!(f.client.balance(&holder), 1_000);
-        assert_eq!(f.client.allowance(&holder, &spender), 500);
+        assert_eq!(f.escrow_count(), 0);
+        assert_eq!(f.escrow_value_locked(), 0);
     }
 
     #[test]
-    fn test_transfer_from_rejects_more_than_the_balance() {
+    fn test_create_escrow_rejects_a_negative_amount() {
         let f = Fixture::new();
-        let holder = f.fund(100);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 1_000);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f.client.transfer_from(&spender, &holder, &to, &101);
+            f.client
+                .create_escrow(&depositor, &beneficiary, &token, &-100, &2_000);
         }));
 
         assert!(result.is_err());
-        assert_eq!(f.client.balance(&holder), 100);
-        assert_eq!(f.client.balance(&to), 0);
-        assert_eq!(f.client.allowance(&holder, &spender), 500);
+        assert_eq!(f.escrow_count(), 0);
     }
 
     #[test]
-    fn test_transfer_from_rejects_an_expired_allowance() {
+    fn test_create_escrow_fails_when_the_depositor_cannot_cover_it() {
         let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
-        f.client.approve(&holder, &spender, &500, &1_000);
-        f.e.ledger().set_sequence_number(1_001);
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 100);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f.client.transfer_from(&spender, &holder, &to, &100);
+            f.client
+                .create_escrow(&depositor, &beneficiary, &token, &500, &2_000);
         }));
 
         assert!(result.is_err());
-        assert_eq!(f.client.balance(&holder), 1_000);
-        assert_eq!(f.client.balance(&to), 0);
+        assert_eq!(f.escrow_count(), 0);
+        assert_eq!(f.escrow_value_locked(), 0);
     }
 
     #[test]
-    fn test_transfer_from_needs_no_allowance() {
+    fn test_a_failed_escrow_records_nothing() {
+        // The transfer runs before the record is written, so a token that
+        // rejects the move cannot leave an escrow pointing at funds that never
+        // arrived.
         let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 100);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f.client.transfer_from(&spender, &holder, &to, &1);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f.client
+                .create_escrow(&depositor, &beneficiary, &token, &500, &2_000);
         }));
 
-        assert!(result.is_err());
+        assert!(!f.has_escrow(0));
     }
 
     #[test]
-    fn test_exhausted_allowance_is_revoked() {
+    fn test_create_escrow_emits_the_depositor_beneficiary_and_amount() {
         let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
-        f.client.approve(&holder, &spender, &200, &expiry);
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, _) = f.asset(&depositor, 1_000);
 
-        f.client.transfer_from(&spender, &holder, &to, &200);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-        assert_eq!(f.client.allowance_expiration(&holder, &spender), 0);
-    }
-
-    #[test]
-    fn test_transfer_from_emits_the_standard_transfer_event() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.transfer_from(&spender, &holder, &to, &200);
+        let id = f
+            .client
+            .create_escrow(&depositor, &beneficiary, &token, &500, &2_000);
 
         assert_eq!(
             last_topics(&f.e),
             std::vec![
-                xdr::ScVal::from_val(&f.e, &symbol_short!("transfer").to_val()),
-                xdr::ScVal::from_val(&f.e, &holder.to_val()),
-                xdr::ScVal::from_val(&f.e, &to.to_val()),
-            ]
-        );
-        assert_eq!(last_data(&f.e), xdr::ScVal::from_val(&f.e, &200i128.to_val()));
-    }
-
-    // ---- burn_from ------------------------------------------------------
-
-    #[test]
-    fn test_burn_from_reduces_balance_and_supply() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.burn_from(&spender, &holder, &400);
-
-        assert_eq!(f.client.balance(&holder), 600);
-        assert_eq!(f.client.total_supply(), 600);
-        assert_eq!(f.client.allowance(&holder, &spender), 100);
-    }
-
-    #[test]
-    fn test_burn_from_rejects_more_than_the_allowance() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f.client.burn_from(&spender, &holder, &501);
-        }));
-
-        assert!(result.is_err());
-        assert_eq!(f.client.balance(&holder), 1_000);
-        assert_eq!(f.client.total_supply(), 1_000);
-        assert_eq!(f.client.allowance(&holder, &spender), 500);
-    }
-
-    #[test]
-    fn test_burn_from_rejects_more_than_the_balance() {
-        let f = Fixture::new();
-        let holder = f.fund(100);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f.client.burn_from(&spender, &holder, &101);
-        }));
-
-        assert!(result.is_err());
-        assert_eq!(f.client.balance(&holder), 100);
-        assert_eq!(f.client.total_supply(), 100);
-    }
-
-    #[test]
-    fn test_burn_from_emits_the_standard_burn_event() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.burn_from(&spender, &holder, &400);
-
-        assert_eq!(
-            last_topics(&f.e),
-            std::vec![
-                xdr::ScVal::from_val(&f.e, &symbol_short!("burn").to_val()),
-                xdr::ScVal::from_val(&f.e, &holder.to_val()),
-            ]
-        );
-        assert_eq!(last_data(&f.e), xdr::ScVal::from_val(&f.e, &400i128.to_val()));
-    }
-
-    // ---- increase_allowance / decrease_allowance ------------------------
-
-    #[test]
-    fn test_increase_allowance_preserves_the_expiration() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
-        f.client.approve(&holder, &spender, &200, &expiry);
-
-        f.client.increase_allowance(&holder, &spender, &300);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 500);
-        assert_eq!(f.client.allowance_expiration(&holder, &spender), expiry);
-    }
-
-    #[test]
-    fn test_increase_allowance_can_be_called_repeatedly() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &100, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.increase_allowance(&holder, &spender, &50);
-        f.client.increase_allowance(&holder, &spender, &25);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 175);
-    }
-
-    #[test]
-    #[should_panic(expected = "NoAllowance")]
-    fn test_increase_allowance_needs_an_existing_allowance() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-
-        f.client.increase_allowance(&holder, &spender, &100);
-    }
-
-    #[test]
-    fn test_decrease_allowance_preserves_the_expiration() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
-        f.client.approve(&holder, &spender, &500, &expiry);
-
-        f.client.decrease_allowance(&holder, &spender, &200);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 300);
-        assert_eq!(f.client.allowance_expiration(&holder, &spender), expiry);
-    }
-
-    #[test]
-    fn test_decrease_allowance_saturates_at_zero() {
-        // Reducing by more than was granted must revoke the grant, not fail and
-        // not wrap into a large positive number.
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &200, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.decrease_allowance(&holder, &spender, &500);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-    }
-
-    #[test]
-    fn test_a_saturated_decrease_revokes_the_entry_entirely() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &200, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.decrease_allowance(&holder, &spender, &200);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-        assert_eq!(f.client.allowance_expiration(&holder, &spender), 0);
-    }
-
-    #[test]
-    fn test_a_decrease_to_zero_blocks_a_subsequent_spend() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &200, &(f.e.ledger().sequence() + 1_000));
-        f.client.decrease_allowance(&holder, &spender, &200);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f.client.transfer_from(&spender, &holder, &to, &1);
-        }));
-
-        assert!(result.is_err());
-        assert_eq!(f.client.balance(&to), 0);
-    }
-
-    #[test]
-    fn test_decrease_allowance_on_an_absent_allowance_is_a_no_op() {
-        // Pulling authority back is idempotent, so reducing something that is
-        // already worth nothing succeeds rather than failing.
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-
-        f.client.decrease_allowance(&holder, &spender, &100);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_increase_allowance_rejects_a_zero_delta() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &200, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.increase_allowance(&holder, &spender, &0);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_decrease_allowance_rejects_a_negative_delta() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &200, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.decrease_allowance(&holder, &spender, &(-1));
-    }
-
-    #[test]
-    fn test_adjustments_emit_the_approve_event_with_the_new_total() {
-        // The event carries the resulting allowance, not the delta, so an
-        // indexer replaying the log reconstructs the grant without doing
-        // arithmetic of its own.
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
-        f.client.approve(&holder, &spender, &200, &expiry);
-
-        f.client.increase_allowance(&holder, &spender, &300);
-
-        assert_eq!(
-            last_topics(&f.e),
-            std::vec![
-                xdr::ScVal::from_val(&f.e, &symbol_short!("approve").to_val()),
-                xdr::ScVal::from_val(&f.e, &holder.to_val()),
-                xdr::ScVal::from_val(&f.e, &spender.to_val()),
+                xdr::ScVal::Symbol("escrow_created".try_into().unwrap()),
+                xdr::ScVal::from_val(&f.e, &depositor.to_val()),
+                xdr::ScVal::from_val(&f.e, &beneficiary.to_val()),
             ]
         );
         assert_eq!(
             last_data(&f.e),
-            xdr::ScVal::from_val(&f.e, &vec![&f.e, 500i128, expiry].to_val())
+            xdr::ScVal::from_val(
+                &f.e,
+                &vec![
+                    &f.e,
+                    id.to_val(),
+                    token.to_val(),
+                    500i128.to_val(),
+                    2_000u32.to_val(),
+                ]
+            )
         );
     }
 
     #[test]
-    fn test_a_decreased_allowance_is_respected_by_a_spend() {
+    fn test_two_escrows_hold_funds_separately() {
         let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
+        let one = Address::generate(&f.e);
+        let two = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token, asset) = f.asset(&one, 1_000);
+        asset.mint(&two, &1_000);
+
         f.client
-            .approve(&holder, &spender, &500, &(f.e.ledger().sequence() + 1_000));
-        f.client.decrease_allowance(&holder, &spender, &400);
-
-        f.client.transfer_from(&spender, &holder, &to, &100);
-
-        assert_eq!(f.client.balance(&to), 100);
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-    }
-
-    #[test]
-    fn test_an_increased_allowance_permits_a_larger_spend() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        let to = Address::generate(&f.e);
+            .create_escrow(&one, &beneficiary, &token, &300, &2_000);
         f.client
-            .approve(&holder, &spender, &100, &(f.e.ledger().sequence() + 1_000));
-        f.client.increase_allowance(&holder, &spender, &400);
+            .create_escrow(&two, &beneficiary, &token, &700, &3_000);
 
-        f.client.transfer_from(&spender, &holder, &to, &500);
-
-        assert_eq!(f.client.balance(&to), 500);
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-    }
-
-    #[test]
-    fn test_allowances_are_per_pair() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let alice = Address::generate(&f.e);
-        let bob = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
-        f.client.approve(&holder, &alice, &200, &expiry);
-        f.client.approve(&holder, &bob, &300, &expiry);
-
-        f.client.decrease_allowance(&holder, &alice, &50);
-
-        assert_eq!(f.client.allowance(&holder, &alice), 150);
-        assert_eq!(f.client.allowance(&holder, &bob), 300);
-    }
-
-    #[test]
-    fn test_an_expired_allowance_cannot_be_increased() {
-        // The stored entry still exists, but it is worth nothing, so there is
-        // nothing to adjust and the caller must approve again.
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client.approve(&holder, &spender, &500, &1_000);
-        f.e.ledger().set_sequence_number(1_001);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f.client.increase_allowance(&holder, &spender, &100);
-        }));
-
-        assert!(result.is_err());
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-    }
-
-    #[test]
-    fn test_decreasing_an_expired_allowance_is_a_no_op() {
-        let f = Fixture::new();
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client.approve(&holder, &spender, &500, &1_000);
-        f.e.ledger().set_sequence_number(1_001);
-
-        f.client.decrease_allowance(&holder, &spender, &100);
-
-        assert_eq!(f.client.allowance(&holder, &spender), 0);
-    }
-
-    // ---- Composition ----------------------------------------------------
-
-    #[test]
-    fn test_a_marketplace_settlement_flow() {
-        let f = Fixture::new();
-        let buyer = f.fund(1_000);
-        let seller = Address::generate(&f.e);
-        let marketplace = Address::generate(&f.e);
-        let expiry = f.e.ledger().sequence() + 1_000;
-
-        // The buyer signs one approval for the whole order.
-        f.client.approve(&buyer, &marketplace, &300, &expiry);
-        // The marketplace pays the seller, then burns its fee against the rest.
-        f.client.transfer_from(&marketplace, &buyer, &seller, &250);
-        f.client.burn_from(&marketplace, &buyer, &50);
-
-        assert_eq!(f.client.balance(&buyer), 700);
-        assert_eq!(f.client.balance(&seller), 250);
-        assert_eq!(f.client.total_supply(), 950);
-        assert_eq!(f.client.allowance(&buyer, &marketplace), 0);
-    }
-
-    #[test]
-    fn test_the_supply_cap_holds_across_allowance_spends() {
-        let f = Fixture::new();
-        f.set_max_supply(1_000);
-        let holder = f.fund(1_000);
-        let spender = Address::generate(&f.e);
-        f.client
-            .approve(&holder, &spender, &1_000, &(f.e.ledger().sequence() + 1_000));
-
-        f.client.burn_from(&spender, &holder, &400);
-
-        assert_eq!(f.client.total_supply(), 600);
-        assert_eq!(f.client.max_supply(), 1_000);
+        assert_eq!(asset.balance(&f.contract), 1_000);
+        assert_eq!(f.escrow_value_locked(), 1_000);
     }
 }

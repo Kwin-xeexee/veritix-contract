@@ -12,17 +12,6 @@ pub struct Mint {
     pub amount: i128,
 }
 
-/// `from` destroyed `amount` of their own tokens.
-///
-/// Topics are `["burn", from: Address]` and the data is `[amount: i128]`.
-#[contractevent(data_format = "vec")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Burn {
-    #[topic]
-    pub from: Address,
-    pub amount: i128,
-}
-
 /// Tokens moved from `from` to `to`.
 ///
 /// Topics are `["transfer", from: Address, to: Address]` and the data is
@@ -53,4 +42,37 @@ pub struct Approve {
     pub spender: Address,
     pub amount: i128,
     pub expiration_ledger: u32,
+}
+
+/// `owner` cleared every approval they had granted.
+///
+/// Topics are `["allowances_revoked", owner: Address]` and the data is
+/// `[count: u32]`. The count is in the event rather than only in the return
+/// value so the sweep is auditable from the log, even for a caller that
+/// discarded the return.
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowancesRevoked {
+    #[topic]
+    pub owner: Address,
+    pub count: u32,
+}
+
+/// A new escrow was created.
+///
+/// Topics are `["escrow_created", depositor: Address, beneficiary: Address]`
+/// and the data is `[id: u32, token: Address, amount: i128, deadline_ledger:
+/// u32]`. Both parties are topics so an operator can filter escrows by either
+/// side without decoding the payload.
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowCreated {
+    #[topic]
+    pub depositor: Address,
+    #[topic]
+    pub beneficiary: Address,
+    pub id: u32,
+    pub token: Address,
+    pub amount: i128,
+    pub deadline_ledger: u32,
 }
