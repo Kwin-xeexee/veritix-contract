@@ -1,0 +1,1 @@
+pub fn create_vesting() {\n    // lock tokens until target ledger\n}\n

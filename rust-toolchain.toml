@@ -2,3 +2,12 @@
 channel = "1.97.1"
 targets = ["wasm32v1-none"]
 components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy"]
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src"]
+# `wasm32v1-none`, not `wasm32-unknown-unknown`: soroban-sdk 28's build script
+# rejects the older target on Rust 1.82+, because it enables `reference-types`
+# and `multi-value`, which the Soroban environment does not support.
+targets = ["wasm32v1-none"]
+profile = "minimal"

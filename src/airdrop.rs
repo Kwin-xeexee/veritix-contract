@@ -1,0 +1,1 @@
+pub fn airdrop() {\n    // distribute evenly across current holders\n}\n

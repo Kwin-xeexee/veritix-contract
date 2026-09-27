@@ -1,0 +1,1 @@
+pub fn set_paused() {\n    // pause contract\n}\n

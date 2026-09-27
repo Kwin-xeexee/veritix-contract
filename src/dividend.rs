@@ -1,0 +1,1 @@
+pub fn distribute_dividend() {\n    // pay holders pro rata\n}\n
