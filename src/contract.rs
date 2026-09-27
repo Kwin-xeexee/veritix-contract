@@ -1,106 +1,11 @@
-//! The contract's public Soroban interface.
-//!
-//! Every function an integrator can call lives here. The implementations sit in
-//! the modules behind it, so this file stays a thin, auditable list of what
-//! the contract exposes and which module enforces each rule.
-//!
-//! The name `VeritixToken` is retained from the pre-rebuild contract, which
-//! `CONTRIBUTING.md` still describes.
-
-use soroban_sdk::{contract, contractimpl, Address, Env};
-
-use crate::admin;
-
-/// The deployed contract.
-#[contract]
-pub struct VeritixToken;
-
-#[contractimpl]
-impl VeritixToken {
-    /// Initialize with an admin and no supply cap.
-    ///
-    /// # Panics
-    ///
-    /// With `"contract already initialized"` if an admin is already set.
-    pub fn initialize(e: Env, admin: Address) {
-        admin::initialize(e, admin);
-    }
-
-    /// Initialize with an admin and a supply cap that can never be raised.
-    ///
-    /// # Panics
-    ///
-    /// With `"max supply must be positive"` if `max_supply` is not strictly
-    /// positive, or `"contract already initialized"` if an admin is already set.
-    pub fn initialize_with_max_supply(e: Env, admin: Address, max_supply: i128) {
-        admin::initialize_with_max_supply(e, admin, max_supply);
-    }
-
-    /// The current admin.
-    ///
-    /// # Panics
-    ///
-    /// With `"contract not initialized"` if the contract is uninitialized.
-    pub fn admin(e: &Env) -> Address {
-        admin::current_admin(e)
-    }
-
-    /// Whether an admin has been set.
-    pub fn is_initialized(e: &Env) -> bool {
-        admin::is_initialized(e)
-    }
-
-    /// The nominated next admin, if a rotation is in flight.
-    pub fn pending_admin(e: &Env) -> Option<Address> {
-        admin::pending_admin(e)
-    }
-
-    /// The ledger from which the most recent accepted admin is authoritative,
-    /// or `0` if no admin has taken over.
-    pub fn admin_active_after_ledger(e: &Env) -> u32 {
-        admin::admin_active_after_ledger(e)
-    }
-
-    /// The hard supply cap fixed at initialization, if this deployment has one.
-    pub fn max_supply(e: &Env) -> Option<i128> {
-        admin::max_supply(e)
-    }
-
-    /// Nominate a new admin. No control moves until they accept.
-    pub fn transfer_ownership(e: &Env, new_admin: Address) {
-        admin::transfer_ownership(e, new_admin);
-    }
-
-    /// Accept a pending rotation, becoming the admin.
-    pub fn accept_admin(e: &Env, new_admin: Address) {
-        admin::accept_admin(e, new_admin);
-    }
-
-    /// Set the address that must co-sign every clawback.
-    pub fn set_clawback_cosigner(e: &Env, admin: Address, cosigner: Address) {
-        admin::set_clawback_cosigner(e, &admin, &cosigner);
-    }
-
-    /// The configured clawback co-signer, if any.
-    pub fn read_clawback_cosigner(e: &Env) -> Option<Address> {
-        admin::read_clawback_cosigner(e)
 use crate::metadata::{self, TokenMetadata};
-use crate::storage_types::DataKey;
-use crate::{admin, balance, control};
-use crate::{admin, balance};
+use crate::storage_types::{DataKey, EscrowRecord};
+use crate::{admin, balance, escrow};
 use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
 #[contract]
 pub struct VeriTixPay;
 
-/// Stores the admin, an optional co-signer, and the token metadata, refusing a
-/// second call.
-fn initialize_state(
-    e: &Env,
-    admin_addr: &Address,
-    co_signer: &Option<Address>,
-    meta: &TokenMetadata,
-) {
 /// Stores the admin and the token metadata, refusing a second call.
 fn initialize_state(e: &Env, admin_addr: &Address, meta: &TokenMetadata) {
     if admin::is_initialized(e) {
@@ -111,7 +16,6 @@ fn initialize_state(e: &Env, admin_addr: &Address, meta: &TokenMetadata) {
     e.storage()
         .persistent()
         .set(&DataKey::InitializedAtLedger, &e.ledger().sequence());
-    admin::store_co_signer(e, co_signer);
     metadata::store(e, meta);
 }
 
@@ -119,30 +23,14 @@ fn initialize_state(e: &Env, admin_addr: &Address, meta: &TokenMetadata) {
 impl VeriTixPay {
     /// Sets the admin and the default token metadata.
     ///
-    /// The admin address is the root of trust for every privileged entry point,
-    /// so initialization is deliberately one-shot: a second call is rejected
-    /// rather than silently replacing the admin.
+    /// One-shot: a second call is rejected rather than silently replacing the
+    /// admin, because the admin is the root of trust for every privileged entry
+    /// point below.
     pub fn initialize(e: Env, admin_addr: Address) {
-        initialize_state(&e, &admin_addr, &None, &metadata::defaults(&e));
-    }
-
-    /// Sets the admin, an optional clawback co-signer, and caller-supplied
-    /// token metadata.
-    ///
-    /// Same one-shot rule as [`initialize`]; use this when a regulated
-    /// deployment needs a second approval key on clawback, or a token name,
-    /// symbol or precision other than the defaults.
-    pub fn initialize_with_co_signer(
-        e: Env,
-        admin_addr: Address,
-        co_signer: Option<Address>,
         initialize_state(&e, &admin_addr, &metadata::defaults(&e));
     }
 
     /// Sets the admin and caller-supplied token metadata.
-    ///
-    /// Same one-shot rule as [`initialize`]; use this when the deployment needs
-    /// a token name, symbol or precision other than the defaults.
     pub fn initialize_with_metadata(
         e: Env,
         admin_addr: Address,
@@ -153,7 +41,6 @@ impl VeriTixPay {
         initialize_state(
             &e,
             &admin_addr,
-            &co_signer,
             &TokenMetadata {
                 name,
                 symbol,
@@ -170,11 +57,6 @@ impl VeriTixPay {
     /// The address currently holding admin authority.
     pub fn admin(e: Env) -> Address {
         admin::admin(&e)
-    }
-
-    /// The co-signer that must approve clawbacks, when one is configured.
-    pub fn co_signer(e: Env) -> Option<Address> {
-        admin::co_signer(&e)
     }
 
     /// Ledger on which the contract was initialized, 0 when it never was.
@@ -202,89 +84,86 @@ impl VeriTixPay {
         balance::balance_of(&e, &account)
     }
 
-    /// Tokens of `account` currently held in active escrows.
-    pub fn escrow_locked(e: Env, account: Address) -> i128 {
-        balance::escrow_locked(&e, &account)
-    }
-
-    /// Tokens `account` may move right now: the balance minus escrow locks, or
-    /// 0 while the account is frozen.
-    pub fn spendable_balance(e: Env, account: Address) -> i128 {
-        balance::spendable_balance(&e, &account)
-    }
-
     /// Tokens in circulation.
     pub fn total_supply(e: Env) -> i128 {
         balance::total_supply(&e)
     }
 
-    /// Whether the contract is paused.
-    pub fn is_paused(e: Env) -> bool {
-        control::is_paused(&e)
+    /// The hard cap on total supply, or 0 when supply is unlimited.
+    pub fn max_supply(e: Env) -> i128 {
+        balance::max_supply(&e)
     }
 
-    /// Whether `account` is frozen.
-    pub fn is_frozen(e: Env, account: Address) -> bool {
-        control::is_frozen(&e, &account)
-    }
-
-    /// Mints `amount` new tokens to `to`.
-    ///
-    /// Admin-only and supply-capped. This is the prerequisite the rest of the
-    /// token module is built on: without a way to bring supply into
-    /// circulation there is nothing to transfer, burn or claw back.
-    /// Mints `amount` new tokens to `to`.
-    ///
-    /// Admin-only and supply-capped: the cap is the first place a supply limit
-    /// has to hold, so the check lives in the balance module next to the
-    /// arithmetic it protects rather than being repeated by every caller.
+    /// Mints `amount` new tokens to `to`. Admin-only and supply-capped.
     pub fn mint(e: Env, admin_addr: Address, to: Address, amount: i128) {
         admin::check_admin(&e, &admin_addr);
         balance::mint(&e, &to, amount);
     }
 
-    /// Destroys `amount` of the caller's own tokens.
-    ///
-    /// Holder-authorized: `from` must sign the call. Burning reduces the balance
-    /// and total supply together, so the two ledgers stay consistent.
-    pub fn burn(e: Env, from: Address, amount: i128) {
-        from.require_auth();
-        balance::burn(&e, &from, amount);
-    }
-
     /// Moves `amount` of tokens from `from` to `to`.
-    ///
-    /// The central token operation, and therefore the path every compliance
-    /// control is enforced on: the contract must not be paused, and neither
-    /// party may be frozen. `from` must sign the call.
     pub fn transfer(e: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         balance::transfer(&e, &from, &to, amount);
     }
 
-    /// Recovers `amount` from `from` on the admin's authority.
+    // ---- Escrow ---------------------------------------------------------
+
+    /// Holds `amount` of `token` for `beneficiary` until the event settles, and
+    /// returns the new escrow's id.
     ///
-    /// For recovering tokens from sanctioned accounts. The admin signs, and the
-    /// co-signer signs too when one is configured at initialization. The holder
-    /// does not sign: that is the whole point of a clawback, which is why it
-    /// emits its own event rather than reusing the burn event.
-    pub fn clawback(e: Env, admin_addr: Address, from: Address, amount: i128) {
-        admin::check_admin(&e, &admin_addr);
-        admin::require_co_signer(&e);
-        balance::clawback(&e, &admin_addr, &from, amount);
+    /// The funds leave the depositor immediately and sit in the contract, so a
+    /// buyer cannot walk away after a ticket is sold.
+    pub fn create_escrow(
+        e: Env,
+        depositor: Address,
+        beneficiary: Address,
+        token: Address,
+        amount: i128,
+        deadline_ledger: u32,
+    ) -> u32 {
+        escrow::create(&e, &depositor, &beneficiary, &token, amount, deadline_ledger)
     }
 
-    /// Freezes or thaws `account`. A frozen account keeps its balance but
-    /// cannot send or receive tokens.
-    pub fn set_frozen(e: Env, admin_addr: Address, account: Address, frozen: bool) {
-        admin::check_admin(&e, &admin_addr);
-        control::set_frozen(&e, &account, frozen);
+    /// Pays the beneficiary everything still held and closes the escrow.
+    ///
+    /// Settlable by the depositor or the admin, and only while the escrow is
+    /// `Active`.
+    pub fn release_escrow(e: Env, caller: Address, escrow_id: u32) {
+        escrow::release(&e, &caller, escrow_id);
     }
 
-    /// Pauses or resumes the contract. While paused, no tokens move.
-    pub fn set_paused(e: Env, admin_addr: Address, paused: bool) {
-        admin::check_admin(&e, &admin_addr);
-        control::set_paused(&e, paused);
+    /// Returns everything still held to the depositor and closes the escrow.
+    ///
+    /// Settlable by the depositor or the admin, and only while the escrow is
+    /// `Active`.
+    pub fn refund_escrow(e: Env, caller: Address, escrow_id: u32) {
+        escrow::refund(&e, &caller, escrow_id);
+    }
+
+    /// Pays `amount` of the held funds to the beneficiary, leaving the escrow
+    /// `Active` if anything is still owed.
+    pub fn release_partial_escrow(e: Env, caller: Address, escrow_id: u32, amount: i128) {
+        escrow::release_partial(&e, &caller, escrow_id, amount);
+    }
+
+    /// The full record for `escrow_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no escrow exists at `escrow_id`, so a client cannot mistake
+    /// "never created" for a record of zeros.
+    pub fn get_escrow(e: Env, escrow_id: u32) -> EscrowRecord {
+        escrow::record(&e, escrow_id)
+    }
+
+    /// Whether `escrow_id` has been settled — released or refunded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no escrow exists at `escrow_id`, for the same reason
+    /// [`get_escrow`] does.
+    pub fn is_escrow_settled(e: Env, escrow_id: u32) -> bool {
+        escrow::is_settled(&e, escrow_id)
     }
 
     /// Raises a dispute over `escrow_id`, freezing it until a ruling is final.
@@ -322,544 +201,585 @@ impl VeriTixPay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_types::EscrowStatus;
+    use soroban_sdk::token::StellarAssetClient;
     use soroban_sdk::testutils::{Address as _, Events as _};
-    use soroban_sdk::{symbol_short, vec, xdr, FromVal};
+    use soroban_sdk::{vec, xdr, FromVal, IntoVal};
 
-    fn setup() -> (Env, VeriTixPayClient<'static>, Address) {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        client.initialize(&admin);
-        (e, client, admin)
+    struct Fixture {
+        e: Env,
+        client: VeriTixPayClient<'static>,
+        contract_id: Address,
+        contract: Address,
+        admin: Address,
     }
 
-    /// Mirrors the escrow module: escrowing records a lock against the holder
-    /// without moving tokens. The escrow feature that will own this key is not
-    /// part of this branch, so the test writes the aggregate directly.
-    fn set_escrow_lock(e: &Env, contract_id: &Address, account: &Address, locked: i128) {
-        e.as_contract(contract_id, || {
-            e.storage()
-                .persistent()
-                .set(&DataKey::EscrowLocked(account.clone()), &locked);
-        });
+    impl Fixture {
+        fn new() -> Self {
+            let e = Env::default();
+            e.mock_all_auths();
+            let contract_id = e.register_contract(None, VeriTixPay);
+            let client = VeriTixPayClient::new(&e, &contract_id);
+            let admin = Address::generate(&e);
+            client.initialize(&admin);
+            let contract = contract_id.clone();
+            Fixture {
+                e,
+                client,
+                contract_id,
+                contract,
+                admin,
+            }
+        }
+
+        /// A SEP-41 asset, and an escrow over `amount` of it.
+        fn escrow(
+            &self,
+            amount: i128,
+        ) -> (Address, Address, Address, StellarAssetClient<'static>, u32) {
+            let depositor = Address::generate(&self.e);
+            let beneficiary = Address::generate(&self.e);
+            let token_address = self
+                .e
+                .register_stellar_asset_contract_v2(self.admin.clone())
+                .address();
+            let token = StellarAssetClient::new(&self.e, &token_address);
+            token.mint(&depositor, &amount);
+            let id = self.client.create_escrow(
+                &depositor,
+                &beneficiary,
+                &token_address,
+                &amount,
+                &2_000,
+            );
+            (depositor, beneficiary, token_address, token, id)
+        }
+
+        /// A SEP-41 asset with `holder` holding `amount` of it.
+        fn asset(&self, holder: &Address, amount: i128) -> (Address, StellarAssetClient<'static>) {
+            let address = self
+                .e
+                .register_stellar_asset_contract_v2(self.admin.clone())
+                .address();
+            let token = StellarAssetClient::new(&self.e, &address);
+            token.mint(holder, &amount);
+            (address, token)
+        }
+
+        /// The total the contract reports as still held in escrow.
+        fn locked(&self) -> i128 {
+            self.e
+                .as_contract(&self.contract_id, || escrow::value_locked(&self.e))
+        }
+
+        fn escrows_created(&self) -> u32 {
+            self.e
+                .as_contract(&self.contract_id, || escrow::count(&self.e))
+        }
     }
 
-    fn funded(client: &VeriTixPayClient<'static>, admin: &Address, holder: &Address, amount: i128) {
-        client.mint(admin, holder, &amount);
-    /// Installs a supply cap. Choosing the cap belongs to the initializer, so
-    /// the test writes the storage key directly instead of adding a setter that
-    /// no issue has asked for.
-    fn install_cap(e: &Env, contract_id: &Address, cap: i128) {
-        e.as_contract(contract_id, || {
-            e.storage().persistent().set(&DataKey::MaxSupply, &cap);
-        });
-    }
-
-    fn setup_capped(cap: i128) -> (Env, VeriTixPayClient<'static>, Address) {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        client.initialize(&admin);
-        install_cap(&e, &contract_id, cap);
-        (e, client, admin)
-    }
-
-    #[test]
-    fn test_initialize_stores_admin_and_defaults() {
-        let (e, client, admin) = setup();
-        assert!(client.is_initialized());
-        assert_eq!(client.admin(), admin);
-        assert_eq!(client.initialized_at_ledger(), e.ledger().sequence());
-        assert_eq!(client.name(), String::from_str(&e, "VeriTix"));
-        assert_eq!(client.symbol(), String::from_str(&e, "VTX"));
-        assert_eq!(client.decimals(), 7);
-        assert_eq!(client.co_signer(), None);
-    }
-
-    #[test]
-    #[should_panic(expected = "AlreadyInitialized")]
-    fn test_initialize_twice_panics() {
-        let (e, client, _admin) = setup();
-        let other = Address::generate(&e);
-        client.initialize(&other);
-    }
-
-    #[test]
-    fn test_initialize_with_co_signer_stores_signer_and_metadata() {
-    fn test_initialize_with_metadata_overrides_defaults() {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        let co_signer = Address::generate(&e);
-
-        client.initialize_with_co_signer(
-            &admin,
-            &Some(co_signer.clone()),
-
-        client.initialize_with_metadata(
-            &admin,
-            &String::from_str(&e, "Event Tickets"),
-            &String::from_str(&e, "VTIX"),
-            &2,
-        );
-
-        assert_eq!(client.admin(), admin);
-        assert_eq!(client.co_signer(), Some(co_signer));
-        assert_eq!(client.name(), String::from_str(&e, "Event Tickets"));
-        assert_eq!(client.name(), String::from_str(&e, "Event Tickets"));
-        assert_eq!(client.symbol(), String::from_str(&e, "VTIX"));
-        assert_eq!(client.decimals(), 2);
-    }
-
-    #[test]
-    fn test_burn_reduces_balance_and_supply() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.burn(&holder, &400);
-
-        assert_eq!(client.balance(&holder), 600);
-        assert_eq!(client.total_supply(), 600);
-    }
-
-    #[test]
-    fn test_burn_of_the_entire_balance() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.burn(&holder, &1_000);
-
-        assert_eq!(client.balance(&holder), 0);
-    fn test_balance_and_supply_start_at_zero() {
-        let (e, client, _admin) = setup();
-        let user = Address::generate(&e);
-        assert_eq!(client.balance(&user), 0);
-        assert_eq!(client.total_supply(), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "InsufficientBalance")]
-    fn test_burn_rejects_amount_above_the_balance() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.burn(&holder, &1_001);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_burn_rejects_zero_amount() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.burn(&holder, &0);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_burn_rejects_negative_amount() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.burn(&holder, &(-1));
-    }
-
-    #[test]
-    fn test_burn_emits_event_with_standard_topics_and_data() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.burn(&holder, &400);
-
+    fn last_topics(e: &Env) -> std::vec::Vec<xdr::ScVal> {
         let events = e.events().all();
-        let last = events.events().last().expect("no events recorded");
+        let last = events.events().last().expect("no event was emitted");
         let xdr::ContractEventBody::V0(body) = &last.body else {
             panic!("expected a v0 contract event");
         };
-        assert_eq!(
-            body.topics,
-            std::vec![
-                xdr::ScVal::from_val(&e, &symbol_short!("burn").to_val()),
-                xdr::ScVal::from_val(&e, &holder.to_val()),
-            ]
-        );
-        assert_eq!(body.data, xdr::ScVal::from_val(&e, &vec![&e, 400i128].to_val()));
+        body.topics.clone()
     }
 
-    #[test]
-    fn test_transfer_moves_the_balance() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-
-        client.transfer(&from, &to, &250);
-
-        assert_eq!(client.balance(&from), 750);
-        assert_eq!(client.balance(&to), 250);
-        assert_eq!(client.total_supply(), 1_000);
-    }
-
-    #[test]
-    fn test_transfer_never_changes_total_supply() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-
-        client.transfer(&from, &to, &1_000);
-
-        assert_eq!(client.balance(&from), 0);
-    fn test_mint_credits_balance_and_grows_supply() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-
-        client.mint(&admin, &user, &1_000);
-
-        assert_eq!(client.balance(&user), 1_000);
-        assert_eq!(client.total_supply(), 1_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "InsufficientBalance")]
-    fn test_transfer_rejects_amount_above_the_balance() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 100);
-
-        client.transfer(&from, &to, &101);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_transfer_rejects_non_positive_amount() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-
-        client.transfer(&from, &to, &0);
-    }
-
-    #[test]
-    #[should_panic(expected = "Frozen")]
-    fn test_transfer_rejects_a_frozen_sender() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-        client.set_frozen(&admin, &from, &true);
-
-        client.transfer(&from, &to, &100);
-    }
-
-    #[test]
-    #[should_panic(expected = "Frozen")]
-    fn test_transfer_rejects_a_frozen_recipient() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-        client.set_frozen(&admin, &to, &true);
-
-        client.transfer(&from, &to, &100);
-    }
-
-    #[test]
-    #[should_panic(expected = "Paused")]
-    fn test_transfer_rejects_while_paused() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-        client.set_paused(&admin, &true);
-
-        client.transfer(&from, &to, &100);
-    }
-
-    #[test]
-    fn test_unfreezing_and_resuming_restores_transfers() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-        client.set_frozen(&admin, &from, &true);
-        client.set_paused(&admin, &true);
-
-        client.set_frozen(&admin, &from, &false);
-        client.set_paused(&admin, &false);
-        client.transfer(&from, &to, &100);
-
-        assert_eq!(client.balance(&to), 100);
-        assert!(!client.is_frozen(&from));
-        assert!(!client.is_paused());
-    fn test_mint_accumulates_across_calls() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-
-        client.mint(&admin, &user, &1_000);
-        client.mint(&admin, &user, &500);
-
-        assert_eq!(client.balance(&user), 1_500);
-        assert_eq!(client.total_supply(), 1_500);
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized: caller is not the contract admin")]
-    fn test_set_frozen_is_admin_only() {
-        let (e, client, _admin) = setup();
-        let stranger = Address::generate(&e);
-        let victim = Address::generate(&e);
-
-        client.set_frozen(&stranger, &victim, &true);
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized: caller is not the contract admin")]
-    fn test_set_paused_is_admin_only() {
-        let (e, client, _admin) = setup();
-        let stranger = Address::generate(&e);
-
-        client.set_paused(&stranger, &true);
-    }
-
-    #[test]
-    fn test_transfer_emits_event_with_standard_topics_and_data() {
-        let (e, client, admin) = setup();
-        let from = Address::generate(&e);
-        let to = Address::generate(&e);
-        funded(&client, &admin, &from, 1_000);
-
-        client.transfer(&from, &to, &250);
-
+    fn last_data(e: &Env) -> xdr::ScVal {
         let events = e.events().all();
-        let last = events.events().last().expect("no events recorded");
+        let last = events.events().last().expect("no event was emitted");
         let xdr::ContractEventBody::V0(body) = &last.body else {
             panic!("expected a v0 contract event");
         };
+        body.data.clone().expect("an event with no data")
+    }
+
+    fn panics<R>(f: impl FnOnce() -> R) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+    }
+
+    // ---- create_escrow (prerequisite) -----------------------------------
+
+    #[test]
+    fn create_escrow_holds_the_funds_for_the_beneficiary() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, _id) = f.escrow(1_000);
+
+        assert_eq!(token.balance(&depositor), 0);
+        assert_eq!(token.balance(&f.contract), 1_000);
+        assert_eq!(token.balance(&beneficiary), 0);
+        assert_eq!(f.locked(), 1_000);
+    }
+
+    #[test]
+    fn a_new_escrow_is_active_and_spendable_by_neither_side() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        assert!(!f.client.is_escrow_settled(&id));
+        assert_eq!(f.client.get_escrow(&id).status, EscrowStatus::Active);
+    }
+
+    // ---- #883: release_escrow -------------------------------------------
+
+    #[test]
+    fn release_pays_the_beneficiary_everything_held() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.release_escrow(&Address::generate(&f.e), &id);
+
+        assert_eq!(token.balance(&beneficiary), 1_000);
+        assert_eq!(token.balance(&f.contract), 0);
+    }
+
+    #[test]
+    fn release_marks_the_escrow_released_and_settled() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        f.client.release_escrow(&Address::generate(&f.e), &id);
+
+        assert_eq!(f.client.get_escrow(&id).status, EscrowStatus::Released);
+        assert!(f.client.is_escrow_settled(&id));
+    }
+
+    #[test]
+    fn release_decrements_the_locked_value() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        f.client.release_escrow(&Address::generate(&f.e), &id);
+
+        assert_eq!(f.locked(), 0);
+    }
+
+    #[test]
+    fn the_depositor_can_release() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.release_escrow(&depositor, &id);
+
+        assert_eq!(token.balance(&beneficiary), 1_000);
+    }
+
+    #[test]
+    fn the_admin_can_release() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.release_escrow(&f.admin, &id);
+
+        assert_eq!(token.balance(&beneficiary), 1_000);
+    }
+
+    #[test]
+    fn a_stranger_cannot_release() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+        let stranger = Address::generate(&f.e);
+
+        assert!(panics(|| {
+            f.client.release_escrow(&stranger, &id);
+        }));
+        assert_eq!(token.balance(&f.contract), 1_000);
+        assert!(!f.client.is_escrow_settled(&id));
+    }
+
+    #[test]
+    fn a_released_escrow_cannot_be_released_again() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+        f.client.release_escrow(&f.admin, &id);
+
+        assert!(panics(|| {
+            f.client.release_escrow(&f.admin, &id);
+        }));
+        // The beneficiary is paid once, not twice.
+        assert_eq!(token.balance(&beneficiary), 1_000);
+        assert_eq!(f.locked(), 0);
+    }
+
+    #[test]
+    fn releasing_an_unknown_escrow_panics() {
+        let f = Fixture::new();
+
+        assert!(panics(|| {
+            f.client.release_escrow(&f.admin, &99);
+        }));
+    }
+
+    #[test]
+    fn release_emits_the_beneficiary_the_id_and_the_amount() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        f.client.release_escrow(&f.admin, &id);
+
         assert_eq!(
-            body.topics,
+            last_topics(&f.e),
             std::vec![
-                xdr::ScVal::from_val(&e, &symbol_short!("transfer").to_val()),
-                xdr::ScVal::from_val(&e, &from.to_val()),
-                xdr::ScVal::from_val(&e, &to.to_val()),
+                xdr::ScVal::Symbol("escrow_released".try_into().unwrap()),
+                xdr::ScVal::from_val(&f.e, &beneficiary.to_val()),
             ]
         );
-        assert_eq!(body.data, xdr::ScVal::from_val(&e, &vec![&e, 250i128].to_val()));
-    }
-
-    #[test]
-    fn test_clawback_debits_the_holder_and_reduces_supply() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.clawback(&admin, &holder, &400);
-
-        assert_eq!(client.balance(&holder), 600);
-        assert_eq!(client.total_supply(), 600);
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized: caller is not the contract admin")]
-    fn test_clawback_rejects_a_non_admin() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        let stranger = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.clawback(&stranger, &holder, &400);
-    }
-
-    #[test]
-    #[should_panic(expected = "InsufficientBalance")]
-    fn test_clawback_rejects_amount_above_the_balance() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 100);
-
-        client.clawback(&admin, &holder, &101);
-    }
-
-    #[test]
-    fn test_clawback_works_without_a_co_signer() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.clawback(&admin, &holder, &1_000);
-
-        assert_eq!(client.balance(&holder), 0);
-    }
-
-    #[test]
-    fn test_clawback_emits_its_own_event() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        client.clawback(&admin, &holder, &400);
-
-        let events = e.events().all();
-        let last = events.events().last().expect("no events recorded");
-        let xdr::ContractEventBody::V0(body) = &last.body else {
-    fn test_mint_rejects_non_admin() {
-        let (e, client, _admin) = setup();
-        let stranger = Address::generate(&e);
-        let user = Address::generate(&e);
-        client.mint(&stranger, &user, &1_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_mint_rejects_zero_amount() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &0);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidAmount")]
-    fn test_mint_rejects_negative_amount() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &(-1));
-    }
-
-    #[test]
-    #[should_panic(expected = "SupplyCapExceeded")]
-    fn test_mint_rejects_amount_over_the_cap() {
-        let (e, client, admin) = setup_capped(1_000);
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &1_001);
-    }
-
-    #[test]
-    fn test_mint_allows_amount_exactly_at_the_cap() {
-        let (e, client, admin) = setup_capped(1_000);
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &1_000);
-        assert_eq!(client.total_supply(), 1_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "SupplyCapExceeded")]
-    fn test_mint_counts_prior_mints_against_the_cap() {
-        let (e, client, admin) = setup_capped(1_000);
-        let user = Address::generate(&e);
-        client.mint(&admin, &user, &600);
-        client.mint(&admin, &user, &500);
-    }
-
-    #[test]
-    fn test_mint_emits_event_with_standard_topics_and_data() {
-        let (e, client, admin) = setup();
-        let user = Address::generate(&e);
-
-        client.mint(&admin, &user, &1_000);
-
-        let events = e.events().all();
-        assert_eq!(events.events().len(), 1);
-        let xdr::ContractEventBody::V0(body) = &events.events()[0].body else {
-            panic!("expected a v0 contract event");
-        };
         assert_eq!(
-            body.topics,
+            last_data(&f.e),
+            xdr::ScVal::from_val(
+                &f.e,
+                &vec![&f.e, id.to_val(), 1_000i128.to_val(), 0i128.to_val()]
+            )
+        );
+    }
+
+    #[test]
+    fn releasing_one_escrow_leaves_the_others_locked() {
+        let f = Fixture::new();
+        let (_d1, _b1, _t1, _a1, first) = f.escrow(400);
+        let (_d2, _b2, _t2, _a2, second) = f.escrow(600);
+
+        f.client.release_escrow(&f.admin, &first);
+
+        assert!(f.client.is_escrow_settled(&first));
+        assert!(!f.client.is_escrow_settled(&second));
+        assert_eq!(f.locked(), 600);
+    }
+
+    // ---- #884: refund_escrow --------------------------------------------
+
+    #[test]
+    fn refund_pays_the_depositor_everything_held() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.refund_escrow(&depositor, &id);
+
+        assert_eq!(token.balance(&depositor), 1_000);
+        assert_eq!(token.balance(&f.contract), 0);
+        assert_eq!(token.balance(&beneficiary), 0);
+    }
+
+    #[test]
+    fn refund_marks_the_escrow_refunded_and_settled() {
+        let f = Fixture::new();
+        let (depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        f.client.refund_escrow(&depositor, &id);
+
+        assert_eq!(f.client.get_escrow(&id).status, EscrowStatus::Refunded);
+        assert!(f.client.is_escrow_settled(&id));
+        assert_eq!(f.locked(), 0);
+    }
+
+    #[test]
+    fn the_admin_can_refund() {
+        let f = Fixture::new();
+        let (depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.refund_escrow(&f.admin, &id);
+
+        assert_eq!(token.balance(&depositor), 1_000);
+    }
+
+    #[test]
+    fn a_stranger_cannot_refund() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+        let stranger = Address::generate(&f.e);
+
+        assert!(panics(|| {
+            f.client.refund_escrow(&stranger, &id);
+        }));
+        assert_eq!(token.balance(&f.contract), 1_000);
+        assert!(!f.client.is_escrow_settled(&id));
+    }
+
+    #[test]
+    fn a_refunded_escrow_cannot_be_released() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+        f.client.refund_escrow(&depositor, &id);
+
+        assert!(panics(|| {
+            f.client.release_escrow(&f.admin, &id);
+        }));
+        assert_eq!(token.balance(&beneficiary), 0);
+        assert_eq!(token.balance(&depositor), 1_000);
+    }
+
+    #[test]
+    fn a_released_escrow_cannot_be_refunded() {
+        let f = Fixture::new();
+        let (depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+        f.client.release_escrow(&f.admin, &id);
+
+        assert!(panics(|| {
+            f.client.refund_escrow(&depositor, &id);
+        }));
+        assert_eq!(token.balance(&depositor), 0);
+    }
+
+    #[test]
+    fn refund_emits_the_depositor_the_id_and_the_amount() {
+        let f = Fixture::new();
+        let (depositor, _beneficiary, _token_address, _token, id) = f.escrow(750);
+
+        f.client.refund_escrow(&depositor, &id);
+
+        assert_eq!(
+            last_topics(&f.e),
             std::vec![
-                xdr::ScVal::from_val(&e, &symbol_short!("clawback").to_val()),
-                xdr::ScVal::from_val(&e, &admin.to_val()),
-                xdr::ScVal::from_val(&e, &holder.to_val()),
-            ]
-        );
-        assert_eq!(body.data, xdr::ScVal::from_val(&e, &vec![&e, 400i128].to_val()));
-    }
-
-    #[test]
-    fn test_spendable_balance_matches_the_balance_without_locks() {
-        let (e, client, admin) = setup();
-        let holder = Address::generate(&e);
-        funded(&client, &admin, &holder, 1_000);
-
-        assert_eq!(client.spendable_balance(&holder), 1_000);
-        assert_eq!(client.escrow_locked(&holder), 0);
-    }
-
-    #[test]
-    fn test_spendable_balance_excludes_escrow_locks() {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        let holder = Address::generate(&e);
-        client.initialize(&admin);
-        client.mint(&admin, &holder, &1_000);
-        set_escrow_lock(&e, &contract_id, &holder, 400);
-
-        assert_eq!(client.balance(&holder), 1_000);
-        assert_eq!(client.escrow_locked(&holder), 400);
-        assert_eq!(client.spendable_balance(&holder), 600);
-    }
-
-    #[test]
-    fn test_spendable_balance_is_zero_for_a_frozen_account() {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        let holder = Address::generate(&e);
-        client.initialize(&admin);
-        client.mint(&admin, &holder, &1_000);
-        client.set_frozen(&admin, &holder, &true);
-
-        assert_eq!(client.balance(&holder), 1_000);
-        assert_eq!(client.spendable_balance(&holder), 0);
-    }
-
-    #[test]
-    fn test_spendable_balance_never_goes_negative() {
-        let e = Env::default();
-        e.mock_all_auths();
-        let contract_id = e.register_contract(None, VeriTixPay);
-        let client = VeriTixPayClient::new(&e, &contract_id);
-        let admin = Address::generate(&e);
-        let holder = Address::generate(&e);
-        client.initialize(&admin);
-        client.mint(&admin, &holder, &1_000);
-        // A lock larger than the balance cannot happen through the escrow
-        // module, which validates first, but a stale record must not make this
-        // view report a negative amount.
-        set_escrow_lock(&e, &contract_id, &holder, 5_000);
-
-        assert_eq!(client.spendable_balance(&holder), 0);
-    }
-
-    #[test]
-    fn test_spendable_balance_of_an_unknown_account_is_zero() {
-        let (e, client, _admin) = setup();
-        let stranger = Address::generate(&e);
-        assert_eq!(client.spendable_balance(&stranger), 0);
-                xdr::ScVal::from_val(&e, &symbol_short!("mint").to_val()),
-                xdr::ScVal::from_val(&e, &user.to_val()),
+                xdr::ScVal::Symbol("escrow_refunded".try_into().unwrap()),
+                xdr::ScVal::from_val(&f.e, &depositor.to_val()),
             ]
         );
         assert_eq!(
-            body.data,
-            xdr::ScVal::from_val(&e, &vec![&e, 1_000i128].to_val())
+            last_data(&f.e),
+            xdr::ScVal::from_val(&f.e, &vec![&f.e, id.to_val(), 750i128.to_val()])
         );
+    }
+
+    // ---- #885: release_partial_escrow ----------------------------------
+
+    #[test]
+    fn a_partial_release_pays_only_that_amount() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.release_partial_escrow(&f.admin, &id, &300);
+
+        assert_eq!(token.balance(&beneficiary), 300);
+        assert_eq!(token.balance(&f.contract), 700);
+    }
+
+    #[test]
+    fn a_partial_release_reduces_the_record_and_leaves_it_active() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        f.client.release_partial_escrow(&f.admin, &id, &300);
+
+        let record = f.client.get_escrow(&id);
+        assert_eq!(record.amount, 700);
+        assert_eq!(record.status, EscrowStatus::Active);
+        assert!(!f.client.is_escrow_settled(&id));
+    }
+
+    #[test]
+    fn a_partial_release_decrements_the_locked_value() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        f.client.release_partial_escrow(&f.admin, &id, &300);
+
+        assert_eq!(f.locked(), 700);
+    }
+
+    #[test]
+    fn successive_partial_releases_add_up() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.release_partial_escrow(&f.admin, &id, &300);
+        f.client.release_partial_escrow(&f.admin, &id, &200);
+
+        assert_eq!(token.balance(&beneficiary), 500);
+        assert_eq!(f.client.get_escrow(&id).amount, 500);
+        assert_eq!(f.locked(), 500);
+    }
+
+    #[test]
+    fn a_partial_release_of_the_remainder_settles_the_escrow() {
+        // "Active until the remainder is zero" — the call that takes it to zero
+        // is the one that closes the escrow.
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.release_partial_escrow(&f.admin, &id, &300);
+        f.client.release_partial_escrow(&f.admin, &id, &700);
+
+        assert_eq!(token.balance(&beneficiary), 1_000);
+        let record = f.client.get_escrow(&id);
+        assert_eq!(record.amount, 0);
+        assert_eq!(record.status, EscrowStatus::Released);
+        assert!(f.client.is_escrow_settled(&id));
+        assert_eq!(f.locked(), 0);
+    }
+
+    #[test]
+    fn a_partial_release_above_the_remainder_is_refused() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+        f.client.release_partial_escrow(&f.admin, &id, &300);
+
+        assert!(panics(|| {
+            f.client.release_partial_escrow(&f.admin, &id, &701);
+        }));
+        assert_eq!(token.balance(&beneficiary), 300);
+        assert_eq!(f.client.get_escrow(&id).amount, 700);
+        assert_eq!(f.locked(), 700);
+    }
+
+    #[test]
+    fn a_partial_release_of_zero_is_refused() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        assert!(panics(|| {
+            f.client.release_partial_escrow(&f.admin, &id, &0);
+        }));
+        assert_eq!(token.balance(&beneficiary), 0);
+        assert_eq!(f.client.get_escrow(&id).amount, 1_000);
+    }
+
+    #[test]
+    fn a_negative_partial_release_is_refused() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        assert!(panics(|| {
+            f.client.release_partial_escrow(&f.admin, &id, &-100);
+        }));
+        assert_eq!(token.balance(&beneficiary), 0);
+        assert_eq!(f.client.get_escrow(&id).amount, 1_000);
+        assert_eq!(f.locked(), 1_000);
+    }
+
+    #[test]
+    fn a_settled_escrow_cannot_be_partially_released() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+        f.client.release_escrow(&f.admin, &id);
+
+        assert!(panics(|| {
+            f.client.release_partial_escrow(&f.admin, &id, &100);
+        }));
+        assert_eq!(token.balance(&beneficiary), 1_000);
+    }
+
+    #[test]
+    fn a_stranger_cannot_partially_release() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+        let stranger = Address::generate(&f.e);
+
+        assert!(panics(|| {
+            f.client.release_partial_escrow(&stranger, &id, &100);
+        }));
+        assert_eq!(token.balance(&f.contract), 1_000);
+    }
+
+    #[test]
+    fn the_depositor_can_partially_release() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, token, id) = f.escrow(1_000);
+
+        f.client.release_partial_escrow(&depositor, &id, &250);
+
+        assert_eq!(token.balance(&beneficiary), 250);
+    }
+
+    #[test]
+    fn a_full_release_after_a_partial_pays_the_remainder() {
+        let f = Fixture::new();
+        let (_depositor, beneficiary, _token_address, token, id) = f.escrow(1_000);
+        f.client.release_partial_escrow(&f.admin, &id, &250);
+
+        f.client.release_escrow(&f.admin, &id);
+
+        assert_eq!(token.balance(&beneficiary), 1_000);
+        assert_eq!(f.locked(), 0);
+        assert!(f.client.is_escrow_settled(&id));
+    }
+
+    #[test]
+    fn a_partial_release_reports_the_remaining_amount() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        f.client.release_partial_escrow(&f.admin, &id, &300);
+
+        assert_eq!(
+            last_data(&f.e),
+            xdr::ScVal::from_val(
+                &f.e,
+                &vec![&f.e, id.to_val(), 300i128.to_val(), 700i128.to_val()]
+            )
+        );
+    }
+
+    // ---- #886: the views -----------------------------------------------
+
+    #[test]
+    fn get_escrow_returns_the_stored_record() {
+        let f = Fixture::new();
+        let depositor = Address::generate(&f.e);
+        let beneficiary = Address::generate(&f.e);
+        let (token_address, _) = f.asset(&depositor, 2_000);
+        let id = f
+            .client
+            .create_escrow(&depositor, &beneficiary, &token_address, &1_000, &2_000);
+
+        let record = f.client.get_escrow(&id);
+
+        assert_eq!(record.depositor, depositor);
+        assert_eq!(record.beneficiary, beneficiary);
+        assert_eq!(record.token, token_address);
+        assert_eq!(record.amount, 1_000);
+        assert_eq!(record.deadline_ledger, 2_000);
+        assert_eq!(record.status, EscrowStatus::Active);
+    }
+
+    #[test]
+    fn get_escrow_panics_on_an_unknown_id() {
+        let f = Fixture::new();
+
+        assert!(panics(|| {
+            f.client.get_escrow(&7);
+        }));
+    }
+
+    #[test]
+    fn is_escrow_settled_is_false_before_and_true_after() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        assert!(!f.client.is_escrow_settled(&id));
+        f.client.release_escrow(&f.admin, &id);
+        assert!(f.client.is_escrow_settled(&id));
+    }
+
+    #[test]
+    fn is_escrow_settled_is_true_for_a_refund_too() {
+        let f = Fixture::new();
+        let (depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+
+        f.client.refund_escrow(&depositor, &id);
+
+        assert!(f.client.is_escrow_settled(&id));
+    }
+
+    #[test]
+    fn is_escrow_settled_panics_on_an_unknown_id() {
+        // "Not settled" would be a false answer to a question about an escrow
+        // that does not exist, and the caller would carry it forward.
+        let f = Fixture::new();
+
+        assert!(panics(|| {
+            f.client.is_escrow_settled(&7);
+        }));
+    }
+
+    #[test]
+    fn the_view_follows_a_partial_release() {
+        let f = Fixture::new();
+        let (_depositor, _beneficiary, _token_address, _token, id) = f.escrow(1_000);
+        f.client.release_partial_escrow(&f.admin, &id, &400);
+
+        assert_eq!(f.client.get_escrow(&id).amount, 600);
+        assert!(!f.client.is_escrow_settled(&id));
     }
 }

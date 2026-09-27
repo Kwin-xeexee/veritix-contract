@@ -1,38 +1,11 @@
-//! Veritix Pay — the on-chain payment module for the Veritix ticketing
-//! platform, built on Soroban (Stellar).
-//!
-//! # Crate layout
-//!
-//! This crate is `no_std`: a Soroban contract is compiled to wasm and has no
-//! access to an operating system, so every dependency is built without the
-//! standard library. `alloc` is deliberately not used either, which keeps the
-//! contract inside the Soroban wasm size limit.
-//!
-//! Each functional area lives in its own module and is re-exported from
-//! `contract`, which is the only public entry surface. Storage keys live in
-//! exactly one place — `storage_types` — so that two modules can never
-//! disagree about where a value is kept.
-//!
-//! # Adding a module
-//!
-//! 1. Create `src/your_module.rs`.
-//! 2. Declare it below with `mod your_module;`.
-//! 3. Add any new `DataKey` variants to `storage_types.rs`.
-//! 4. Add tests in `src/your_module_test.rs` and declare that module behind
-//!    `#[cfg(test)]`.
-//! 5. Expose the public entry points from `contract.rs`.
-//!
-//! Do not add a blanket `#![allow(dead_code)]`. Unused code is removed, not
-//! silenced.
-
 #![no_std]
+// The contract is being rebuilt module by module, so a few storage helpers
+// land ahead of the contract entry points that will eventually call them.
+#![allow(dead_code)]
 
-// The wasm artifact has no standard library: it is linked for
-// `wasm32v1-none`, where there is no `std` and no unwinding runtime. The unit
-// tests, however, run on the host, and a `#![no_std]` crate built for a host
-// target has no panic handler to link against. Pulling in `std` for test
-// builds only gives those builds one. This is test-only — `std` is never
-// linked into the deployed contract.
+// The host-side tests build expected event topic lists with `std::vec!` and
+// catch the panics that guards raise. The crate is `no_std` so the contract
+// never links std, but the test build does.
 #[cfg(test)]
 extern crate std;
 

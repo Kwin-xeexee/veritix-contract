@@ -1,28 +1,2 @@
 /target
 **/*.rs.bk
-**/*.rs.bk
-# Rust build artifacts
-/target
-**/*.rs.bk
-*.pdb
-
-# Local override of the pinned toolchain and cargo config
-/rust-toolchain.local.toml
-/.cargo/config.local.toml
-
-# Soroban build output
-*.wasm
-/wasm-build
-/build
-
-# Test and coverage output
-*.log
-/coverage
-lcov.info
-
-# Editor and OS noise
-.idea/
-.vscode/
-*.swp
-.DS_Store
-Thumbs.db
