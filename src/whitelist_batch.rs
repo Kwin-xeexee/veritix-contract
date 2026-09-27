@@ -1,0 +1,1 @@
+pub fn add_to_whitelist_batch() {\n    // bulk onboarding\n}\n
