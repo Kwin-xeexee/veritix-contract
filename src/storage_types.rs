@@ -27,14 +27,4 @@ pub enum DataKey {
     Allowance(Address, Address),
     /// Ledger at which `Allowance(from, spender)` expires.
     AllowanceExpiration(Address, Address),
-    /// Whether an account is frozen and cannot move tokens.
-    Frozen(Address),
-    /// Whether the whole contract is paused.
-    Paused,
-    /// Total tokens held in active escrows for an account.
-    EscrowLocked(Address),
-    /// Every account that currently holds a positive balance.
-    HolderSet,
-    /// Number of accounts in `HolderSet`, cached so counting stays O(1).
-    HolderCount,
 }
